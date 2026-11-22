@@ -2934,7 +2934,9 @@ class EventTarget {
   }
 }
 
-class Node extends EventTarget {
+// NOTE: no `extends EventTarget` here -- a derived ctor would run super() per
+// DOM node on the hot wrapping path. The chain is attached once below.
+class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
@@ -2954,7 +2956,7 @@ class Node extends EventTarget {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { super(); this._nid = nid; }
+  constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return _nodeDocumentOf(this); }
@@ -3582,6 +3584,8 @@ function _inputFormatNumber(type, n) {
   }
   return String(n);
 }
+
+Object.setPrototypeOf(Node.prototype, EventTarget.prototype);
 
 // WebIDL interface constants live on both the interface object and the interface
 // prototype object (instances inherit; idlharness checks Node.prototype).
@@ -8332,7 +8336,8 @@ function _isWindowReflectingBodyElement(element) {
   return (name === 'body' || name === 'frameset') && element === _windowReflectingBodyElement();
 }
 
-globalThis.Window = globalThis.Window || class Window extends EventTarget {};
+globalThis.Window = globalThis.Window || class Window {};
+Object.setPrototypeOf(globalThis.Window.prototype, EventTarget.prototype);
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
