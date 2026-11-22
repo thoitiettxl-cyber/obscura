@@ -1230,6 +1230,108 @@ impl ObscuraJsRuntime {
             .unwrap_or(false)
     }
 
+    /// Hands a same-origin frame realm its real `parent`, `top`, and
+    /// `frameElement`, replacing the remote placeholders `__obscura_init`
+    /// installs. The objects are the parent's own: within one isolate a frame
+    /// can hold them directly, which is what a browser gives a same-origin
+    /// frame for `window.parent` reads and `parent.foo()` calls.
+    ///
+    /// The parent also goes into the frame's `__obscura_frameObjects` table so
+    /// a message arriving *from* the parent resolves to the same real window.
+    pub(crate) fn bind_parent_objects(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        parent_frame_id: u32,
+        frame_id: u32,
+    ) -> bool {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let parent_context = if parent_frame_id == 0 {
+            Some(main.clone())
+        } else {
+            self.realm_states().borrow().context(parent_frame_id)
+        };
+        let Some(parent_context) = parent_context else {
+            return false;
+        };
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+
+        // Read the parent's global, its document, and the element that framed
+        // this document; all are installed in the frame realm below.
+        let parent_context = v8::Local::new(scope, &parent_context);
+        let (parent_window, frame_element, parent_document) = {
+            let scope = &mut v8::ContextScope::new(scope, parent_context);
+            let global = parent_context.global(scope);
+            let elements = v8::String::new(scope, "__obscura_frameElements")
+                .and_then(|key| global.get(scope, key.into()))
+                .and_then(|value| value.to_object(scope));
+            let frame_element = elements.and_then(|elements| {
+                let index = v8::Integer::new_from_unsigned(scope, frame_id);
+                elements.get(scope, index.into())
+            });
+            let document = v8::String::new(scope, "document")
+                .and_then(|key| global.get(scope, key.into()));
+            (
+                v8::Global::new(scope, global),
+                frame_element.map(|value| v8::Global::new(scope, value)),
+                document.map(|value| v8::Global::new(scope, value)),
+            )
+        };
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let global = realm_context.global(scope);
+        // Matches `_installFramingRelationships`: read-only, enumerable,
+        // configurable.
+        let parent_window = v8::Local::new(scope, parent_window);
+        if let Some(key) = v8::String::new(scope, "parent") {
+            global.define_own_property(
+                scope, key.into(), parent_window.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+        let main_context = v8::Local::new(scope, &main);
+        let top = main_context.global(scope);
+        if let Some(key) = v8::String::new(scope, "top") {
+            global.define_own_property(
+                scope, key.into(), top.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+        if let Some(element) = frame_element {
+            let element = v8::Local::new(scope, element);
+            if let Some(key) = v8::String::new(scope, "frameElement") {
+                global.define_own_property(
+                    scope, key.into(), element.into(), v8::PropertyAttribute::READ_ONLY);
+            }
+        }
+
+
+        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
+            return true;
+        };
+        let Some(registry) = global
+            .get(scope, registry_key.into())
+            .and_then(|value| value.to_object(scope))
+        else {
+            return true;
+        };
+        let entry = v8::Object::new(scope);
+        if let Some(key) = v8::String::new(scope, "window") {
+            entry.set(scope, key.into(), parent_window.into());
+        }
+        if let (Some(key), Some(document)) = (
+            v8::String::new(scope, "document"),
+            parent_document.map(|document| v8::Local::new(scope, document)),
+        ) {
+            entry.set(scope, key.into(), document);
+        }
+        let index = v8::Integer::new_from_unsigned(scope, parent_frame_id);
+        registry
+            .set(scope, index.into(), entry.into())
+            .unwrap_or(false)
+    }
+
     /// The table ops consult to find the calling realm's document.
     pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
         // `op_state` is a plain Rust-side table; no V8 access, no guard.

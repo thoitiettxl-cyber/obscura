@@ -253,29 +253,69 @@ _nativeFnAdd(_functionToString);
     return _cache;
   }
   function _isGlobal(t) { return t === globalThis; }
+  // DOM wrappers and their prototypes: real Chrome exposes no `_`-prefixed
+  // member on them, so the engine's internals are filtered out of the same
+  // reflection APIs when they target anything on the Node chain. `Node` is
+  // resolved lazily (this block runs before its class declaration).
+  function _isDom(t) {
+    if (!t || (typeof t !== 'object' && typeof t !== 'function') || _isGlobal(t)) { return false; }
+    try { return t instanceof Node; } catch (e) { return false; }
+  }
+  function _hiddenName(name) { return typeof name === 'string' && name.charCodeAt(0) === 95; }
   function _filter(t, names) {
-    if (!_isGlobal(t)) { return names; }
-    var set = _set();
-    if (!set) { return names; }
+    var set = _isGlobal(t) ? _set() : null;
+    if (_isGlobal(t) && !set) { return names; }
+    var dom = !_isGlobal(t) && _isDom(t);
+    if (!set && !dom) { return names; }
     var out = [];
-    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    for (var i = 0; i < names.length; i++) {
+      var n = names[i];
+      if ((set && set.has(n)) || (dom && _hiddenName(n))) { continue; }
+      out.push(n);
+    }
     return out;
   }
   var _oGOPN = Object.getOwnPropertyNames;
   var _oOwnKeys = Reflect.ownKeys;
   var _oKeys = Object.keys;
   var _oGOPDs = Object.getOwnPropertyDescriptors;
+  var _oGOPD = Object.getOwnPropertyDescriptor;
+  var _oEntries = Object.entries;
+  var _oValues = Object.values;
   function define(obj, prop, impl) {
     try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
   define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
   define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
   define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  define(Object, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, p) {
+    var d = _oGOPD(t, p);
+    if (d && _isDom(t) && _hiddenName(p)) { return undefined; }
+    if (d && _isGlobal(t)) { var set = _set(); if (set && set.has(p)) { return undefined; } }
+    return d;
+  });
+  define(Object, 'entries', function entries(t) {
+    var all = _oEntries(t);
+    if (_isDom(t)) { return all.filter(function (e) { return !_hiddenName(e[0]); }); }
+    return all;
+  });
+  define(Object, 'values', function values(t) {
+    var all = _oValues(t);
+    if (_isDom(t)) {
+      var ks = _oKeys(t);
+      var out = [];
+      for (var i = 0; i < all.length; i++) { if (!_hiddenName(ks[i])) { out.push(all[i]); } }
+      return out;
+    }
+    return all;
+  });
   define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    } else if (_isDom(t)) {
+      var ks2 = _oGOPN(all); for (var j = 0; j < ks2.length; j++) { if (_hiddenName(ks2[j])) { delete all[ks2[j]]; } }
     }
     return all;
   });
@@ -2024,7 +2064,16 @@ function _eventTargetRemove(target, type, callback, options) {
   if (byType.size === 0) _eventTargetListeners.delete(target);
   _eventTargetListenerChanged.get(target)?.();
 }
+// Real input gestures grant user activation; a scripted event of the same
+// types is indistinguishable at this layer, so any dispatched activation
+// gesture marks it, matching the state Botguard observes after a real click.
+const __obscura_ua = { ever: false };
+const __obscura_ua_types = new Set([
+  'click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart',
+  'keydown', 'keypress', 'input', 'submit',
+]);
 function _eventTargetDispatch(target, event, authorDispatch = false) {
+  if (event && __obscura_ua_types.has(event.type)) __obscura_ua.ever = true;
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
@@ -2501,25 +2550,32 @@ function __prepareInsertedSubtree(root) {
   }
 }
 
+// An enumerable own prop is visible to `for..in` and spread; keep the engine's
+// bookkeeping on nodes non-enumerable.
+function _hiddenOwn(node, name, value) {
+  Object.defineProperty(node, name,
+    { value: value, writable: true, enumerable: false, configurable: true });
+}
+
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
-  node._treeParent = null;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeDetachedExact', true);
+  _hiddenOwn(node, '_treeParent', null);
+  _hiddenOwn(node, '_treeParentEpoch', _treeMutationEpoch);
+  _hiddenOwn(node, '_treeConnected', false);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
-  node._treeParent = parent;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeDetachedExact', false);
+  _hiddenOwn(node, '_treeParent', parent);
+  _hiddenOwn(node, '_treeParentEpoch', _treeMutationEpoch);
+  _hiddenOwn(node, '_treeConnected', !!connected);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedUnchangedConnection(node, connected) {
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeConnected', !!connected);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 // Node documents. The main document owns a node unless its tree's root says
@@ -2956,7 +3012,11 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) {
+    // Own props show up under getOwnPropertyNames; real elements have none.
+    Object.defineProperty(this, '_nid',
+      { value: nid, writable: true, enumerable: false, configurable: true });
+  }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return _nodeDocumentOf(this); }
@@ -3175,8 +3235,8 @@ class Node {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
     const connected = _dom("is_connected", this._nid) === "true";
-    this._treeConnected = connected;
-    this._treeConnectedEpoch = _treeMutationEpoch;
+    _hiddenOwn(this, '_treeConnected', connected);
+    _hiddenOwn(this, '_treeConnectedEpoch', _treeMutationEpoch);
     return connected;
   }
   normalize() {
@@ -3463,7 +3523,7 @@ let __docIsUtf8;
 function _docEncoding() {
   if (__docEncoding === undefined) {
     const e = _domParse("document_encoding");
-    __docEncoding = (typeof e === 'string' && e) ? e : 'UTF-8';
+    __docEncoding = (typeof e === 'string' && e) ? e : 'windows-1252';
     __docIsUtf8 = __docEncoding.toLowerCase() === 'utf-8';
   }
   return __docEncoding;
@@ -4462,8 +4522,35 @@ class Element extends Node {
   }
   get style() { return _elementStyle(this); }
   set style(v) { if (typeof v === "string") _elementStyle(this).cssText = v; }
+  get nonce() {
+    if (this._nonceValue !== undefined) return this._nonceValue;
+    if (this._nullNamespaceAttrs instanceof Map) {
+      return this._nullNamespaceAttrs.get('nonce') || '';
+    }
+    return _domParse("get_attribute", this._nid, "nonce") || '';
+  }
+  set nonce(v) {
+    const value = `${v}`;
+    _hiddenOwn(this, '_nonceValue', value);
+    if (this._nullNamespaceAttrs instanceof Map) {
+      this._nullNamespaceAttrs.set('nonce', value);
+      return;
+    }
+    _dom("set_attribute", this._nid, "nonce", value);
+  }
+  get autocapitalize() { return this.getAttribute('autocapitalize') ?? ''; }
+  set autocapitalize(v) { this.setAttribute('autocapitalize', `${v}`); }
   getAttribute(n) {
     n = _htmlAttrName(this, n);
+    // The nonce attribute is hidden from getAttribute by spec: present reads
+    // back as the empty string, and its value is only reachable through the
+    // .nonce IDL attribute.
+    if (n === 'nonce') {
+      const present = this._nullNamespaceAttrs instanceof Map
+        ? this._nullNamespaceAttrs.has(n)
+        : _domParse("get_attribute", this._nid, n) !== null;
+      return present ? '' : null;
+    }
     // Script-created elements start with a provably empty attribute set. Keep
     // that small null-namespace map coherent through the ordinary mutation
     // APIs so React's write-then-read reflection does not cross the bridge.
@@ -8351,7 +8438,10 @@ function _isWindowReflectingBodyElement(element) {
 }
 
 globalThis.Window = globalThis.Window || class Window {};
-Object.setPrototypeOf(globalThis.Window.prototype, EventTarget.prototype);
+// Chrome's window chain has a WindowProperties hop between Window.prototype
+// and EventTarget.prototype; probes count the links.
+const _windowProperties = Object.create(EventTarget.prototype);
+Object.setPrototypeOf(globalThis.Window.prototype, _windowProperties);
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
@@ -8588,7 +8678,10 @@ globalThis.navigator = {
   devicePosture: { type: 'continuous', onchange: null, addEventListener() {}, removeEventListener() {} },
   virtualKeyboard: { overlaysContent: false, show() {}, hide() {}, ongeometrychange: null, addEventListener() {}, removeEventListener() {} },
   windowControlsOverlay: { visible: false, getTitlebarAreaRect() { return { x: 0, y: 0, width: 0, height: 0 }; }, ongeometrychange: null, addEventListener() {}, removeEventListener() {} },
-  userActivation: { isActive: false, hasBeenActive: false },
+  userActivation: {
+    get isActive() { return __obscura_ua.ever; },
+    get hasBeenActive() { return __obscura_ua.ever; },
+  },
   storageBuckets: { open() { return Promise.resolve({}); }, delete() { return Promise.resolve(); }, keys() { return Promise.resolve([]); } },
   scheduling: { isInputPending() { return false; } },
   ink: { requestPresenter() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } },
@@ -8619,6 +8712,7 @@ globalThis.navigator = {
         bitness: "64",
         brands: brands,
         fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+        formFactors: ["Desktop"],
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
@@ -8825,6 +8919,7 @@ class Screen {
     this._availW = availW === undefined ? w : availW;
     this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
+    this.isExtended = false;
     this.orientation = _mkScreenOrientation();
   }
   get width() { return this._w; }
@@ -8837,6 +8932,8 @@ class Screen {
   if (d && d.get) _markNative(d.get);
 });
 globalThis.Screen = Screen;
+// Screen inherits EventTarget in Chrome (orientationchange targets it).
+Object.setPrototypeOf(Screen.prototype, EventTarget.prototype);
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
   if (globalThis.screen instanceof Screen) {
@@ -13349,6 +13446,8 @@ globalThis.performance = globalThis.performance || {
   globalThis.Performance = class Performance {
     constructor() { throw new TypeError('Illegal constructor'); }
   };
+  // Performance is an EventTarget (resourcetimingbufferfull).
+  Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
   Object.setPrototypeOf(perf, Performance.prototype);
   const buffers = Object.assign(Object.create(null), {mark: [], measure: [], navigation: [], resource: [], paint: [], event: [], 'first-input': [], 'layout-shift': [], 'largest-contentful-paint': [], longtask: [], 'visibility-state': []});
   const latestMarks = new Map();
@@ -21474,6 +21573,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       enumerable: true, configurable: true,
     });
     _getter(Document.prototype, 'prerendering', false);
+    _getter(Document.prototype, 'wasDiscarded', false);
     _getter(Document.prototype, 'xmlVersion', null);
     Object.defineProperty(Document.prototype, 'featurePolicy', {
       get: _fn('get featurePolicy', function() {

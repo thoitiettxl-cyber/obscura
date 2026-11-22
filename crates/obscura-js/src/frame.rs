@@ -143,6 +143,7 @@ impl FrameRealm {
         // `contentDocument` is the initialized one.
         if same_origin {
             parent.publish_realm_objects(&realm.context, frame_id);
+            parent.bind_parent_objects(&realm.context, parent_frame_id, frame_id);
         }
         Some(realm)
     }
@@ -513,6 +514,32 @@ mod tests {
         assert_eq!(parent.evaluate(
             "document.getElementById('host').shadowRoot.textContent").unwrap(),
             serde_json::json!("parent shadow"));
+    }
+
+    /// A same-origin remote-loaded frame gets the real `parent` and `top`,
+    /// not the cross-origin placeholders: page scripts inside it must be able
+    /// to read arbitrary parent properties without a SecurityError.
+    #[test]
+    fn same_origin_frame_reaches_real_parent_window() {
+        let mut parent = page("https://parent.example/",
+            "<html><body>Parent</body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body>Child</body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            let reachable;
+            try { reachable = parent.__obscura_probe === undefined; }
+            catch (error) { return ["blocked", error.name]; }
+            return [
+                reachable,
+                parent === window,
+                parent === top,
+                parent.document === document,
+                top.document === document,
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result, serde_json::json!([true, false, true, false, false]));
     }
 
     #[test]
