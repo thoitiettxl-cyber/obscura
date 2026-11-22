@@ -259,7 +259,7 @@ _nativeFnAdd(_functionToString);
   // resolved lazily (this block runs before its class declaration).
   function _isDom(t) {
     if (!t || (typeof t !== 'object' && typeof t !== 'function') || _isGlobal(t)) { return false; }
-    try { return t instanceof Node; } catch (e) { return false; }
+    try { return typeof t._nid === 'number'; } catch (e) { return false; }
   }
   function _hiddenName(name) { return typeof name === 'string' && name.charCodeAt(0) === 95; }
   function _filter(t, names) {
@@ -2552,10 +2552,7 @@ function __prepareInsertedSubtree(root) {
 
 // An enumerable own prop is visible to `for..in` and spread; keep the engine's
 // bookkeeping on nodes non-enumerable.
-function _hiddenOwn(node, name, value) {
-  Object.defineProperty(node, name,
-    { value: value, writable: true, enumerable: false, configurable: true });
-}
+function _hiddenOwn(node, name, value) { node[name] = value; }
 
 function _seedDetachedTreeState(node) {
   _hiddenOwn(node, '_treeDetachedExact', true);
@@ -3014,8 +3011,7 @@ class Node {
 
   constructor(nid) {
     // Own props show up under getOwnPropertyNames; real elements have none.
-    Object.defineProperty(this, '_nid',
-      { value: nid, writable: true, enumerable: false, configurable: true });
+    this._nid = nid;
   }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }

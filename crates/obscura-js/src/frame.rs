@@ -142,8 +142,7 @@ impl FrameRealm {
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
-            parent.publish_realm_objects(&realm.context, frame_id);
-            parent.bind_parent_objects(&realm.context, parent_frame_id, frame_id);
+            parent.publish_realm_objects(&realm.context, parent_frame_id, frame_id);
         }
         Some(realm)
     }
