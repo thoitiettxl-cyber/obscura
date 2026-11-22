@@ -7857,7 +7857,21 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
-  canPlayType(_type) { return ''; }
+  canPlayType(type) {
+    // Desktop Chrome media support: known containers answer 'maybe' without
+    // codecs and 'probably' with a codec we claim to decode.
+    const m = /^\s*(video|audio)\/([\w.-]+)\s*(?:;\s*codecs\s*=\s*"([^"]+)")?\s*$/i.exec(String(type));
+    if (!m) return '';
+    const kind = m[1].toLowerCase(), container = m[2].toLowerCase(), codecs = m[3];
+    const containers = kind === 'video'
+      ? new Set(['mp4', 'webm', 'ogg', 'x-matroska', 'quicktime'])
+      : new Set(['mpeg', 'mp3', 'mp4', 'aac', 'x-m4a', 'ogg', 'wav', 'wave', 'x-wav', 'webm', 'flac', 'x-flac', 'opus']);
+    if (!containers.has(container)) return '';
+    if (!codecs) return 'maybe';
+    const supported = /^(avc1|avc3|h264|vp8|vp9|vp09|av01|theora|mp4v|hev1|hvc1|mp4a|mp3|vorbis|opus|flac|fLaC|pcm|1$|alac)/i;
+    const list = codecs.split(',').map(c => c.trim());
+    return list.every(c => supported.test(c)) ? 'probably' : '';
+  }
   load() {}
   play() {
     return Promise.reject(new DOMException(
@@ -8638,7 +8652,6 @@ globalThis.navigator = {
     if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
     return Promise.resolve({state: 'granted', onchange: null});
   } },
-  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
@@ -16591,7 +16604,7 @@ globalThis.Selection = class Selection {
 _markNative(globalThis.Selection);
 
 [
-  navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
+  navigator.getGamepads, navigator.sendBeacon,
   navigator.javaEnabled, navigator.geolocation?.getCurrentPosition,
   navigator.geolocation?.watchPosition,
   navigator.serviceWorker?.register,
