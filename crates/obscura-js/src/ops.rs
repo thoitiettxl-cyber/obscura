@@ -9020,6 +9020,32 @@ fn op_compress(
     Ok(BASE64.encode(out))
 }
 
+
+// --- Real GLES backend (crates/obscura-js/src/gl.rs). Returns -1 when the
+// host has no usable libEGL/libGLESv2 so bootstrap can keep its null-context
+// behavior.
+#[op2(fast)]
+fn op_gl_create(state: &mut OpState, width: i32, height: i32, es3: bool) -> i32 {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    let mut registry = registry.borrow_mut();
+    registry.create(width, height, es3)
+}
+
+#[op2(fast)]
+fn op_gl_free(state: &mut OpState, id: i32) {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    registry.borrow_mut().destroy(id);
+}
+
+#[op2]
+#[string]
+fn op_gl(state: &mut OpState, id: i32, #[string] payload: String) -> String {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+    let mut registry = registry.borrow_mut();
+    serde_json::to_string(&registry.call(id, &payload)).unwrap_or_default()
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -9121,6 +9147,9 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_control());
     }
     ops.push(op_frame_preload_scripts());
+    ops.push(op_gl_create());
+    ops.push(op_gl_free());
+    ops.push(op_gl());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),

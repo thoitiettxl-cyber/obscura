@@ -746,6 +746,7 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+                op_state.put(Rc::new(RefCell::new(crate::gl::GlContexts::default())));
             }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();

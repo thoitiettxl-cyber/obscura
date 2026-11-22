@@ -21866,7 +21866,288 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     'getRenderbufferParameter getShaderParameter getTexParameter getVertexAttrib').split(' ');
   var _glFalseMethods = ('isBuffer isEnabled isFramebuffer isProgram isQuery isRenderbuffer isSampler ' +
     'isShader isSync isTexture isTransformFeedback isVertexArray').split(' ');
+  // Real backend: every call forwards to the dlopen'd GLES context created
+  // for this canvas, so reads and rendered pixels are genuine. Falls back to
+  // the pure-JS shim when the host has no GL library.
   function _installWebGLContext(canvas, v2) {
+    var opCreate = __obscuraCore.ops && __obscuraCore.ops.op_gl_create;
+    var gid = opCreate ? opCreate(
+      Math.max(1, (canvas.width | 0) || 300), Math.max(1, (canvas.height | 0) || 150),
+      v2 ? 1 : 0) : -1;
+    if (gid < 0) return _installWebGLContextShim(canvas, v2);
+    var proto = v2 ? globalThis.WebGL2RenderingContext.prototype : globalThis.WebGLRenderingContext.prototype;
+    var ctx = Object.create(proto);
+    ctx._canvas = canvas;
+    ctx.canvas = canvas;
+    ctx.drawingBufferColorSpace = 'srgb';
+    ctx.unpackColorSpace = 'srgb';
+    Object.assign(ctx, _glConsts);
+    if (v2) Object.assign(ctx, _gl2Consts);
+    var params = v2 ? _gl2Params : _gl1Params;
+    var exts = v2 ? _gl2Exts : _gl1Exts;
+    var _g = function(m, a) {
+      var r = __obscuraCore.ops.op_gl(gid, JSON.stringify({ m: m, a: a || [] }));
+      return r ? JSON.parse(r) : null;
+    };
+    var _o = {};
+    var _mk = function(tag, cls, h) {
+      var o = _inst(globalThis[cls]);
+      o._h = h;
+      _o[tag + h] = o;
+      return o;
+    };
+    var _hid = function(o) { return o ? (o._h | 0) : 0; };
+    var _u8b64 = function(d) {
+      if (d == null) return { b: '' };
+      var u8 = d instanceof ArrayBuffer ? new Uint8Array(d)
+        : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
+        : null;
+      if (!u8) return { b: '' };
+      var str = '';
+      for (var i = 0; i < u8.length; i += 0x8000) {
+        str += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+      }
+      return { b: btoa(str) };
+    };
+    var _arr = function(v) { return Array.isArray(v) ? v : Array.from(v || []); };
+
+    var _VOIDS = ('viewport scissor clearColor blendColor colorMask blendFuncSeparate ' +
+      'stencilOpSeparate stencilFuncSeparate blendEquationSeparate blendFunc hint ' +
+      'polygonOffset depthRange sampleCoverage stencilFunc stencilOp clearDepth ' +
+      'clearStencil clear enable disable cullFace depthFunc depthMask frontFace ' +
+      'lineWidth stencilMask pixelStorei stencilMaskSeparate flush finish ' +
+      'compileShader linkProgram useProgram validateProgram generateMipmap ' +
+      'readBuffer vertexAttribPointer enableVertexAttribArray ' +
+      'disableVertexAttribArray vertexAttribDivisor renderbufferStorage ' +
+      'framebufferRenderbuffer activeTexture texParameteri texParameterf ' +
+      'drawArrays drawElements drawArraysInstanced drawElementsInstanced ' +
+      'attachShader detachShader framebufferTexture2D renderbufferStorage ' +
+      'stencilFunc stencilOp').split(' ');
+    var _fwd = function(name) {
+      ctx[name] = _fn(name, function() {
+        var args = Array.prototype.slice.call(arguments);
+        for (var i = 0; i < args.length; i++) {
+          if (args[i] && typeof args[i] === 'object' && args[i]._h !== undefined) {
+            args[i] = args[i]._h;
+          }
+        }
+        _g(name, args);
+      });
+    };
+    _VOIDS.forEach(_fwd);
+    ctx.bindAttribLocation = _fn('bindAttribLocation', function(p, i, n) {
+      _g('bindAttribLocation', [_hid(p), i, String(n)]);
+    });
+
+    ctx.readPixels = _fn('readPixels', function(x, y, w, h, format, type, pixels) {
+      var r = _g('readPixels', [x, y, w, h, format, type]);
+      if (!r || !r.b || !pixels || typeof pixels.set !== 'function') return;
+      var b = _base64ToUint8Array(r.b);
+      pixels.set(b.length > pixels.length ? b.subarray(0, pixels.length) : b);
+    });
+    ctx.getError = _fn('getError', function() { return _g('getError'); });
+    ctx.isEnabled = _fn('isEnabled', function(c) { return !!_g('isEnabled', [c]); });
+    ctx.getSupportedExtensions = _fn('getSupportedExtensions', function() { return exts.slice(); });
+    ctx.getExtension = _fn('getExtension', function(name) {
+      if (exts.indexOf(name) < 0) return null;
+      if (name === 'ANGLE_instanced_arrays') {
+        return {
+          drawArraysInstancedANGLE: function(m, f, c, i) { _g('drawArraysInstanced', [m, f, c, i]); },
+          drawElementsInstancedANGLE: function(m, c, t, o, i) { _g('drawElementsInstanced', [m, c, t, o, i]); },
+          vertexAttribDivisorANGLE: function(x, d) { _g('vertexAttribDivisor', [x, d]); },
+        };
+      }
+      if (name === 'WEBGL_lose_context') {
+        return { loseContext: function() {}, restoreContext: function() {} };
+      }
+      return _glExtObjects[name] || {};
+    });
+    var _GP_F4 = { 0x0C22: 1, 0x8005: 1 };
+    var _GP_F2 = { 0x0B70: 1, 0x846D: 1, 0x846E: 1 };
+    var _GP_B4 = { 0x0C23: 1 };
+    var _GP_B1 = {
+      0x0B71: 1, 0x0BE2: 1, 0x0B45: 1, 0x0B44: 1, 0x0B46: 1, 0x0B48: 1,
+      0x0B90: 1, 0x0C11: 1, 0x8037: 1, 0x809E: 1, 0x80A0: 1, 0x0B72: 1,
+    };
+    var _GP_I4 = { 0x0C10: 1, 0x0BA2: 1, 0x8878: 1 };
+    var _GP_I2 = { 0x0D3A: 1 };
+    var _GP_OBJ = {
+      0x8894: 'b', 0x8895: 'b', 0x8B8D: 'p', 0x8CA6: 'f', 0x8CA7: 'r',
+      0x8069: 't', 0x8514: 't', 0x8A41: 'v',
+    };
+    ctx.getParameter = _fn('getParameter', function(pname) {
+      if (pname === 0x9245 || pname === 0x9246) {
+        return _g('getParameter', [pname === 0x9245 ? 0x1F00 : 0x1F01]);
+      }
+      var r = _g('getParameter', [pname]);
+      if (r === null || r === undefined) {
+        return params[pname] !== undefined ? params[pname] : null;
+      }
+      if (typeof r === 'string') {
+        if (pname === 0x1F02) return 'WebGL ' + (v2 ? '2.0' : '1.0') + ' (' + r + ')';
+        if (pname === 0x8B8C) return 'WebGL GLSL ES ' + (v2 ? '3.0' : '1.0') + ' (' + r + ')';
+        return r;
+      }
+      var arr = Array.isArray(r) ? r : null;
+      var tag = _GP_OBJ[pname];
+      if (tag) { var h = arr ? arr[0] : r; return _o[tag + h] || null; }
+      if (_GP_F4[pname]) return new Float32Array(arr ? arr.slice(0, 4) : [r]);
+      if (_GP_F2[pname]) return new Float32Array(arr ? arr.slice(0, 2) : [r]);
+      if (_GP_B4[pname]) { var b4 = arr || [r]; return [!!b4[0], !!b4[1], !!b4[2], !!b4[3]]; }
+      if (_GP_B1[pname]) return !!(arr ? arr[0] : r);
+      if (_GP_I4[pname]) return new Int32Array(arr ? arr.slice(0, 4) : [r]);
+      if (_GP_I2[pname]) return new Int32Array(arr ? arr.slice(0, 2) : [r]);
+      return arr ? arr[0] : r;
+    });
+    ctx.getContextAttributes = _fn('getContextAttributes', function() {
+      return { alpha: true, antialias: true, depth: true, desynchronized: false,
+        failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+        premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false };
+    });
+    ctx.isContextLost = _fn('isContextLost', function() { return false; });
+    ctx.checkFramebufferStatus = _fn('checkFramebufferStatus', function(t) {
+      return _g('checkFramebufferStatus', [t]);
+    });
+    ctx.getShaderPrecisionFormat = _fn('getShaderPrecisionFormat', function(st, pt) {
+      var r = _g('getShaderPrecisionFormat', [st, pt]);
+      var info = _inst(globalThis.WebGLShaderPrecisionFormat);
+      if (r) { info.rangeMin = r.mn; info.rangeMax = r.mx; info.precision = r.p; }
+      return info;
+    });
+    ctx.getShaderInfoLog = _fn('getShaderInfoLog', function(sh) { return _g('getShaderInfoLog', [_hid(sh)]) || ''; });
+    ctx.getProgramInfoLog = _fn('getProgramInfoLog', function(p) { return _g('getProgramInfoLog', [_hid(p)]) || ''; });
+    ctx.getShaderSource = _fn('getShaderSource', function(sh) { return _g('getShaderSource', [_hid(sh)]) || ''; });
+    ctx.getAttachedShaders = _fn('getAttachedShaders', function(p) {
+      var ids = _g('getAttachedShaders', [_hid(p)]) || [];
+      return ids.map(function(h) { return _o['s' + h]; }).filter(Boolean);
+    });
+    ctx.getActiveAttrib = _fn('getActiveAttrib', function(p, i) {
+      var r = _g('getActiveAttrib', [_hid(p), i]);
+      if (!r) return null;
+      var info = _inst(globalThis.WebGLActiveInfo);
+      info.name = r.n; info.size = r.s; info.type = r.t;
+      return info;
+    });
+    ctx.getActiveUniform = _fn('getActiveUniform', function(p, i) {
+      var r = _g('getActiveUniform', [_hid(p), i]);
+      if (!r) return null;
+      var info = _inst(globalThis.WebGLActiveInfo);
+      info.name = r.n; info.size = r.s; info.type = r.t;
+      return info;
+    });
+    ctx.getAttribLocation = _fn('getAttribLocation', function(p, n) {
+      return _g('getAttribLocation', [_hid(p), String(n)]);
+    });
+    ctx.getUniformLocation = _fn('getUniformLocation', function(p, n) {
+      var loc = _g('getUniformLocation', [_hid(p), String(n)]);
+      return loc === null || loc < 0 ? null : _mk('l', 'WebGLUniformLocation', loc);
+    });
+    ctx.getUniform = _fn('getUniform', function(p, loc) {
+      return _g('getUniform', [_hid(p), _hid(loc)]);
+    });
+    ctx.getShaderParameter = _fn('getShaderParameter', function(sh, p) {
+      var r = _g('getShaderParameter', [_hid(sh), p]);
+      return p === 0x8B81 || p === 0x8B80 || p === 0x8B4F ? !!r : r;
+    });
+    ctx.getProgramParameter = _fn('getProgramParameter', function(p, pname) {
+      var r = _g('getProgramParameter', [_hid(p), pname]);
+      return pname === 0x8B82 || pname === 0x8B83 ? !!r : r;
+    });
+    ctx.getBufferParameter = _fn('getBufferParameter', function(t, p) {
+      return _g('getBufferParameter', [t, p]);
+    });
+    ctx.getFramebufferAttachmentParameter = _fn('getFramebufferAttachmentParameter', function(t, a, p) {
+      return _g('getFramebufferAttachmentParameter', [t, a, p]);
+    });
+    ctx.getRenderbufferParameter = _fn('getRenderbufferParameter', function(t, p) {
+      return _g('getRenderbufferParameter', [t, p]);
+    });
+    ctx.getTexParameter = _fn('getTexParameter', function(t, p) {
+      return _g('getTexParameter', [t, p]);
+    });
+    ctx.getVertexAttrib = _fn('getVertexAttrib', function(i, p) {
+      return _g('getVertexAttrib', [i, p]);
+    });
+    ctx.getVertexAttribOffset = _fn('getVertexAttribOffset', function(i, p) {
+      return _g('getVertexAttribOffset', [i, p]);
+    });
+
+    ctx.createShader = _fn('createShader', function(t) { return _mk('s', 'WebGLShader', _g('createShader', [t])); });
+    ctx.createProgram = _fn('createProgram', function() { return _mk('p', 'WebGLProgram', _g('createProgram')); });
+    ctx.createBuffer = _fn('createBuffer', function() { return _mk('b', 'WebGLBuffer', _g('genBuffers')); });
+    ctx.createTexture = _fn('createTexture', function() { return _mk('t', 'WebGLTexture', _g('genTextures')); });
+    ctx.createRenderbuffer = _fn('createRenderbuffer', function() { return _mk('r', 'WebGLRenderbuffer', _g('genRenderbuffers')); });
+    ctx.createFramebuffer = _fn('createFramebuffer', function() { return _mk('f', 'WebGLFramebuffer', _g('genFramebuffers')); });
+    ctx.createVertexArray = _fn('createVertexArray', function() { return _mk('v', 'WebGLVertexArrayObject', _g('genVertexArrays')); });
+    ctx.shaderSource = _fn('shaderSource', function(sh, src) { _g('shaderSource', [_hid(sh), String(src)]); });
+    ctx.bindBuffer = _fn('bindBuffer', function(t, b) { _g('bindBuffer', [t, _hid(b)]); });
+    ctx.bindTexture = _fn('bindTexture', function(t, tx) { _g('bindTexture', [t, _hid(tx)]); });
+    ctx.bindRenderbuffer = _fn('bindRenderbuffer', function(t, rb) { _g('bindRenderbuffer', [t, _hid(rb)]); });
+    ctx.bindFramebuffer = _fn('bindFramebuffer', function(t, fb) { _g('bindFramebuffer', [t, _hid(fb)]); });
+    ctx.deleteShader = _fn('deleteShader', function(o) { _g('deleteShader', [_hid(o)]); });
+    ctx.deleteProgram = _fn('deleteProgram', function(o) { _g('deleteProgram', [_hid(o)]); });
+    ctx.deleteBuffer = _fn('deleteBuffer', function(o) { _g('deleteBuffer', [_hid(o)]); });
+    ctx.deleteTexture = _fn('deleteTexture', function(o) { _g('deleteTexture', [_hid(o)]); });
+    ctx.deleteRenderbuffer = _fn('deleteRenderbuffer', function(o) { _g('deleteRenderbuffer', [_hid(o)]); });
+    ctx.deleteFramebuffer = _fn('deleteFramebuffer', function(o) { _g('deleteFramebuffer', [_hid(o)]); });
+    ctx.deleteVertexArray = _fn('deleteVertexArray', function(o) { _g('deleteVertexArray', [_hid(o)]); });
+    ctx.isShader = _fn('isShader', function(o) { return !!_g('isShader', [_hid(o)]); });
+    ctx.isProgram = _fn('isProgram', function(o) { return !!_g('isProgram', [_hid(o)]); });
+    ctx.isBuffer = _fn('isBuffer', function(o) { return !!_g('isBuffer', [_hid(o)]); });
+    ctx.isTexture = _fn('isTexture', function(o) { return !!_g('isTexture', [_hid(o)]); });
+    ctx.isRenderbuffer = _fn('isRenderbuffer', function(o) { return !!_g('isRenderbuffer', [_hid(o)]); });
+    ctx.isFramebuffer = _fn('isFramebuffer', function(o) { return !!_g('isFramebuffer', [_hid(o)]); });
+    ctx.isVertexArray = _fn('isVertexArray', function(o) { return !!_g('isVertexArray', [_hid(o)]); });
+    ctx.bufferData = _fn('bufferData', function(t, data, usage) {
+      if (typeof data === 'number') _g('bufferData', [t, { n: data }, usage]);
+      else _g('bufferData', [t, _u8b64(data), usage]);
+    });
+    ctx.bufferSubData = _fn('bufferSubData', function(t, off, data) {
+      _g('bufferSubData', [t, off, _u8b64(data)]);
+    });
+    ctx.texImage2D = _fn('texImage2D', function(t, lvl, internal, w, h, border, format, type, pixels) {
+      if (typeof w === 'number' && typeof h === 'number') {
+        _g('texImage2D', [t, lvl, internal, w, h, border || 0, format, type, _u8b64(pixels)]);
+      }
+    });
+    ['vertexAttrib1f', 'vertexAttrib2f', 'vertexAttrib3f', 'vertexAttrib4f'].forEach(function(name) {
+      ctx[name] = _fn(name, function(i) {
+        _g(name, [i].concat(Array.prototype.slice.call(arguments, 1)));
+      });
+    });
+    ['vertexAttrib1fv', 'vertexAttrib2fv', 'vertexAttrib3fv', 'vertexAttrib4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(i, v) { _g(name, [i, _arr(v)]); });
+    });
+    ['uniform1i', 'uniform2i', 'uniform3i', 'uniform4i',
+     'uniform1f', 'uniform2f', 'uniform3f', 'uniform4f'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc) {
+        _g(name, [_hid(loc)].concat(Array.prototype.slice.call(arguments, 1)));
+      });
+    });
+    ['uniform1iv', 'uniform2iv', 'uniform3iv', 'uniform4iv',
+     'uniform1fv', 'uniform2fv', 'uniform3fv', 'uniform4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc, v) { _g(name, [_hid(loc), _arr(v)]); });
+    });
+    ['uniformMatrix2fv', 'uniformMatrix3fv', 'uniformMatrix4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc, transpose, v) {
+        _g(name, [_hid(loc), transpose ? 1 : 0, _arr(v)]);
+      });
+    });
+    ctx.drawBuffers = _fn('drawBuffers', function(bufs) { _g('drawBuffers', [_arr(bufs)]); });
+    // Methods without a real-backend arm fall back to inert stubs, the same
+    // coverage the pure-JS shim had.
+    for (const m of _glVoidMethods) if (!ctx[m]) ctx[m] = _fn(m, function() {});
+    for (const m of _glNullMethods) if (!ctx[m]) ctx[m] = _fn(m, function() { return null; });
+    for (const m of _glFalseMethods) if (!ctx[m]) ctx[m] = _fn(m, function() { return false; });
+    for (const m in _glObjectCtors) {
+      if (!ctx[m]) ctx[m] = _fn(m, (function(cls) {
+        return function() { return _inst(globalThis[cls]); };
+      })(_glObjectCtors[m]));
+    }
+    return ctx;
+  }
+  function _installWebGLContextShim(canvas, v2) {
+
     var proto = v2 ? globalThis.WebGL2RenderingContext.prototype : globalThis.WebGLRenderingContext.prototype;
     var ctx = Object.create(proto);
     var params = v2 ? _gl2Params : _gl1Params;
