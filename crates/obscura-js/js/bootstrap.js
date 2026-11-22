@@ -20247,6 +20247,14 @@ globalThis.__obscura_init = (function(skipFrames) {
     try { Object.setPrototypeOf(document, globalThis.HTMLDocument.prototype); } catch (_e) {}
   }
   _document = document;
+  // `all` is an own, non-configurable accessor on each connected document
+  // ([LegacyUnforgeable]), not just the prototype getter.
+  try {
+    var _allDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'all');
+    if (_allDesc && _allDesc.get) {
+      Object.defineProperty(document, 'all', { get: _allDesc.get, enumerable: true, configurable: false });
+    }
+  } catch (_e) {}
   // parentNode on <html> reaches the backing document node. Keep that wrapper
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
@@ -21384,10 +21392,11 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _CQS.prototype.size = function() { return 1; };
 
   // --- document.all ---
-  // Live across the owning document: length/item enumerate its elements like
-  // Chrome's all-collection. The true undetectable-object behavior (typeof
-  // document.all === 'undefined') needs a V8 flag rusty_v8 does not bind, so
-  // `typeof` and `== null` checks remain detectable -- flagged in the report.
+  // Chrome's all-collection is an undetectable live object: typeof reports
+  // 'undefined', `== null` is true, yet indexed/named element lookup works.
+  // op_document_all builds that object from a V8 undetectable template and
+  // forwards element lookups to the per-document resolver; misses decline so
+  // the prototype below supplies length/item/namedItem/tags.
   var _HTMLAllCollection = _defClass('HTMLAllCollection');
   Object.defineProperty(_HTMLAllCollection.prototype, 'length', {
     get: function() { try { return this._doc ? this._doc.getElementsByTagName('*').length : 0; } catch (_e) { return 0; } },
@@ -21405,13 +21414,35 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   };
   _HTMLAllCollection.prototype.tags = function() { return this; };
   var _documentAllMap = new WeakMap();
+  function _documentAllFor(doc) {
+    var c = _documentAllMap.get(doc);
+    if (!c) {
+      var created;
+      try {
+        created = __obscuraCore.ops.op_document_all(function(key) {
+          try {
+            var els = doc.getElementsByTagName('*');
+            if (typeof key === 'number') return els[key];
+            if (typeof key !== 'string' || key === '') return undefined;
+            for (var i = 0; i < els.length; i++) { var e = els[i]; if (e.id === key || e.name === key) return e; }
+          } catch (_e) {}
+          return undefined;
+        });
+      } catch (_e) {}
+      if (created === undefined || created === null) {
+        c = _inst(_HTMLAllCollection);
+      } else {
+        c = created;
+        Object.setPrototypeOf(c, _HTMLAllCollection.prototype);
+      }
+      c._doc = doc;
+      _documentAllMap.set(doc, c);
+    }
+    return c;
+  }
   if (globalThis.Document) {
     Object.defineProperty(Document.prototype, 'all', {
-      get: _fn('get all', function() {
-        var c = _documentAllMap.get(this);
-        if (!c) { c = _inst(_HTMLAllCollection); c._doc = this; _documentAllMap.set(this, c); }
-        return c;
-      }),
+      get: _fn('get all', function() { return _documentAllFor(this); }),
       enumerable: true, configurable: true,
     });
   }

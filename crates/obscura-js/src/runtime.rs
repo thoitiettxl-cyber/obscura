@@ -6868,6 +6868,25 @@ mod tests {
     }
 
     #[test]
+    fn document_all_is_undetectable_and_live() {
+        let mut rt = setup_runtime("<html><body><div id='x'></div></body></html>");
+        assert_eq!(
+            rt.evaluate(r#"(() => [
+                typeof document.all,
+                document.all == null,
+                document.all === undefined,
+                !document.all,
+                document.hasOwnProperty('all'),
+                Object.prototype.toString.call(document.all),
+                document.all.length > 0,
+                document.all.item(0).tagName,
+            ])()"#).unwrap(),
+            serde_json::json!(["undefined", true, false, true, true,
+                "[object HTMLAllCollection]", true, "HTML"]),
+        );
+    }
+
+    #[test]
     fn initial_blank_iframe_eval_uses_the_child_realm() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(

@@ -7574,6 +7574,96 @@ fn op_document_realm_member<'s, 'i>(
     member.unwrap_or_else(|| v8::undefined(scope).into())
 }
 
+extern "C" {
+    /// `v8::ObjectTemplate::MarkAsUndetectable`. rusty_v8 does not bind it, so
+    /// link the C++ symbol from the static v8 archive directly. Chrome's
+    /// `document.all` is an undetectable object: `typeof` reports 'undefined'
+    /// and `== null` is true while property access still works.
+    #[link_name = "_ZN2v814ObjectTemplate18MarkAsUndetectableEv"]
+    fn mark_as_undetectable(this: *mut v8::ObjectTemplate);
+    /// `v8::ObjectTemplate::SetCallAsFunctionHandler`, also unbound in
+    /// rusty_v8. V8 requires undetectable objects to be callable (which
+    /// matches Chrome: `document.all(x)` equals `document.all.namedItem(x)`).
+    #[link_name = "_ZN2v814ObjectTemplate24SetCallAsFunctionHandlerEPFvRKNS_20FunctionCallbackInfoINS_5ValueEEEENS_5LocalIS2_EE"]
+    fn set_call_as_function_handler(
+        this: *mut v8::ObjectTemplate,
+        callback: v8::FunctionCallback,
+        data: v8::Local<v8::Value>,
+    );
+}
+
+/// `document.all(arg)` forwards to the same resolver as property lookup.
+unsafe extern "C" fn document_all_call(info: *const v8::FunctionCallbackInfo) {
+    let info = unsafe { &*info };
+    let mut storage = unsafe { v8::CallbackScope::new(info) };
+    let mut scope = unsafe { std::pin::Pin::new_unchecked(&mut storage) }.init();
+    let scope = &mut scope;
+    let args = v8::FunctionCallbackArguments::from_function_callback_info(info);
+    let mut rv = v8::ReturnValue::from_function_callback_info(info);
+    let data = v8::Local::new(scope, args.data());
+    let Ok(resolve) = v8::Local::<v8::Function>::try_from(data) else { return };
+    let arg = if args.length() > 0 { args.get(0) } else { v8::undefined(scope).into() };
+    if let Some(result) = resolve.call(scope, args.this().into(), &[arg]) {
+        rv.set(result);
+    }
+}
+
+fn document_all_resolve(
+    scope: &mut v8::PinScope,
+    args: v8::PropertyCallbackArguments,
+    key: v8::Local<v8::Value>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) -> v8::Intercepted {
+    let data = v8::Local::new(scope, args.data());
+    let Ok(resolve) = v8::Local::<v8::Function>::try_from(data) else { return v8::Intercepted::kNo };
+    let Some(result) = resolve.call(scope, args.holder().into(), &[key]) else { return v8::Intercepted::kNo };
+    if result.is_undefined() { return v8::Intercepted::kNo; }
+    rv.set(result);
+    v8::Intercepted::kYes
+}
+
+/// Chrome's `document.all` is an undetectable live collection. The V8 flag
+/// comes from `mark_as_undetectable`; every named and indexed lookup forwards
+/// to a per-document JS `resolve(key)` returning the element or count, and
+/// `undefined` for misses so normal prototype lookup (`item`, `namedItem`,
+/// `tags`, `hasOwnProperty`) still applies.
+#[op2]
+fn op_document_all<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    resolve: v8::Local<'s, v8::Function>,
+) -> v8::Local<'s, v8::Value> {
+    let object = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let template = v8::ObjectTemplate::new(scope);
+        // SAFETY: `Local<ObjectTemplate>` is a live pointer to a C++
+        // ObjectTemplate; `MarkAsUndetectable(this)` only mutates the template.
+        unsafe { mark_as_undetectable(&*template as *const v8::ObjectTemplate as *mut v8::ObjectTemplate) };
+        // SAFETY: undetectable instances must be callable; the handler forwards
+        // to the same JS resolver while it stays alive as template data.
+        unsafe { set_call_as_function_handler(&*template as *const v8::ObjectTemplate as *mut v8::ObjectTemplate,
+            document_all_call, resolve.into()) };
+        template.set_named_property_handler(v8::NamedPropertyHandlerConfiguration::new()
+            .data(resolve.into())
+            .getter(|scope: &mut v8::PinScope, key: v8::Local<v8::Name>,
+                args: v8::PropertyCallbackArguments, rv: v8::ReturnValue<v8::Value>| {
+                document_all_resolve(scope, args, key.into(), rv)
+            }));
+        template.set_indexed_property_handler(v8::IndexedPropertyHandlerConfiguration::new()
+            .data(resolve.into())
+            .getter(|scope: &mut v8::PinScope, index: u32,
+                args: v8::PropertyCallbackArguments, rv: v8::ReturnValue<v8::Value>| {
+                let key = v8::Integer::new_from_unsigned(scope, index);
+                document_all_resolve(scope, args, key.into(), rv)
+            }));
+        let tag = v8::Symbol::get_to_string_tag(scope);
+        let name = v8::String::new(scope, "HTMLAllCollection")?;
+        template.set(tag.into(), name.into());
+        template.new_instance(scope)
+    }));
+    object.unwrap_or_else(|_| None)
+        .map(Into::into)
+        .unwrap_or_else(|| v8::undefined(scope).into())
+}
+
 /// Limit live contexts and DOM trees, including initial realms awaiting Page
 /// adoption. Synchronous and fetched frames share the same per-page budget.
 pub fn max_live_frames() -> usize {
@@ -8973,6 +9063,7 @@ pub fn build_extension() -> Extension {
         op_frame_relation(),
         op_frame_name(),
         op_document_realm_member(),
+        op_document_all(),
         op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),
