@@ -110,6 +110,25 @@ const __obscuraCore = globalThis.Deno.core;
   }
 })();
 
+// Error stacks must look like a native browser's: platform functions
+// implemented here as JS would otherwise leak `<obscura:*>` frames, which real
+// Chrome never reports (native bindings produce no JS frame). V8 routes every
+// .stack read through Error.prepareStackTrace; dropping the shim frames makes
+// error output match Chrome. Tradeoff: prepareStackTrace is a function where
+// Chrome has undefined, but a stack leak is certain detection while a custom
+// PST is also used by legitimate sites.
+Error.prepareStackTrace = function _obscuraStackFilter(error, frames) {
+  var out = String(error) + '\n';
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var file = '';
+    try { file = f.getFileName() || ''; } catch (_e) {}
+    if (file.indexOf('obscura') !== -1) continue;
+    out += '    at ' + f.toString() + '\n';
+  }
+  return out.slice(0, -1);
+};
+
 // Handoff for child frame realms. deno_core binds ops into the main context
 // only, so a realm restored from the snapshot arrives with its own empty
 // private core reference. The host reads this to take the main realm's bound op table
@@ -8742,6 +8761,7 @@ globalThis.navigator = {
     if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
     return Promise.resolve({state: 'granted', onchange: null});
   } },
+  getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
@@ -8898,6 +8918,8 @@ globalThis.chrome = {
       wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
     };
   },
+  setClientEncryptionKeys() {},
+  setSyncEncryptionKeys() {},
 };
 
 globalThis.Notification = class Notification {
@@ -16699,7 +16721,7 @@ globalThis.Selection = class Selection {
 _markNative(globalThis.Selection);
 
 [
-  navigator.getGamepads, navigator.sendBeacon,
+  navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
   navigator.javaEnabled, navigator.geolocation?.getCurrentPosition,
   navigator.geolocation?.watchPosition,
   navigator.serviceWorker?.register,
@@ -18101,7 +18123,10 @@ globalThis.AudioBuffer = class AudioBuffer {
   copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
 };
 globalThis.AudioContext = class AudioContext {
-  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.outputLatency=0; this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  constructor() { this.sampleRate=_fp('audioSampleRate'); this._aState='suspended'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.outputLatency=0; this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  // Chrome starts an AudioContext suspended under the autoplay policy until a
+  // user activation unlocks it (or resume() runs); 'closed' stays sticky.
+  get state() { return this._aState === 'closed' ? 'closed' : ((__obscura_ua.ever || this._aState === 'running') ? 'running' : 'suspended'); }
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
@@ -18119,9 +18144,9 @@ globalThis.AudioContext = class AudioContext {
   createBuffer(ch,len,rate) { return new globalThis.AudioBuffer({numberOfChannels:ch||1,length:len||0,sampleRate:rate||44100}); }
   createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
   decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
-  resume() { this.state='running'; return Promise.resolve(); }
-  suspend() { this.state='suspended'; return Promise.resolve(); }
-  close() { this.state='closed'; return Promise.resolve(); }
+  resume() { this._aState='running'; return Promise.resolve(); }
+  suspend() { this._aState='suspended'; return Promise.resolve(); }
+  close() { this._aState='closed'; return Promise.resolve(); }
 };
 globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
   constructor(ch,len,rate) {
@@ -21064,6 +21089,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     .split(' ').forEach(function(n) { _defClass(n, _WebGLObject); });
   'WebGLActiveInfo WebGLShaderPrecisionFormat WebGLUniformLocation'
     .split(' ').forEach(function(n) { _defClass(n); });
+  _defClass('Sanitizer');
+  _defClass('Config');
   var _AuthenticatorResponse = _defClass('AuthenticatorResponse');
   _defClass('AuthenticatorAssertionResponse', _AuthenticatorResponse);
   _defClass('AuthenticatorAttestationResponse', _AuthenticatorResponse);
