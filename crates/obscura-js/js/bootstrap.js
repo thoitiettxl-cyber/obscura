@@ -13397,12 +13397,7 @@ globalThis.performance = globalThis.performance || {
   }
   function allEntries() {
     var out = [];
-    for (const type of Object.keys(buffers)) {
-      // The synthesized navigation entry is queryable by type but stays out
-      // of the merged user-facing list (repo gate: user_timing tests).
-      if (type === 'navigation') continue;
-      out = out.concat(buffers[type]);
-    }
+    for (const type of Object.keys(buffers)) out = out.concat(buffers[type]);
     return out;
   }
   function checkPerformance(receiver) {
@@ -17399,23 +17394,20 @@ function _encodePNG(w, h, rgba) {
       raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
     }
   }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
+  // zlib DEFLATE at default level via the codec op: stored (uncompressed)
+  // blocks are a fingerprint tell versus a real browser PNG encoder.
+  var C64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var b64in = '';
+  for (var i = 0; i < raw.length; i += 3) {
+    var n0 = raw[i], n1 = i + 1 < raw.length ? raw[i + 1] : 0, n2 = i + 2 < raw.length ? raw[i + 2] : 0;
+    b64in += C64[n0 >> 2] + C64[((n0 & 3) << 4) | (n1 >> 4)] +
+      (i + 1 < raw.length ? C64[((n1 & 15) << 2) | (n2 >> 6)] : '=') +
+      (i + 2 < raw.length ? C64[n2 & 63] : '=');
   }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  var zB64 = __obscuraCore.ops.op_compress('compress', 'deflate', b64in);
+  var zBin = atob(zB64);
+  var def = new Uint8Array(zBin.length);
+  for (var i = 0; i < zBin.length; i++) def[i] = zBin.charCodeAt(i);
   // CRC32 (lazy table)
   if (!_encodePNG._t) {
     var t = new Uint32Array(256);
@@ -17437,7 +17429,7 @@ function _encodePNG(w, h, rgba) {
   ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
   ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
   ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
+  var png = new Uint8Array(8 + 25 + (12 + def.length) + 12);
   png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
   var p = 8;
   p = putChunk(png, p, 'IHDR', ihd);
@@ -19891,7 +19883,7 @@ if (typeof SharedWorker === 'undefined') {
   };
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
-  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
+  globalThis.ServiceWorkerContainer = class ServiceWorkerContainer { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
 }
 
 if (typeof URLPattern === 'undefined') {
@@ -21465,7 +21457,16 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       e.evaluate = function() { return _inst(globalThis.XPathResult || Object); };
       return e;
     };
-    Document.prototype.lastModified = '';
+    Object.defineProperty(Document.prototype, 'lastModified', {
+      // Chrome falls back to the load time when no Last-Modified header.
+      get: _fn('get lastModified', function() {
+        var d = new Date();
+        function p(n) { return (n < 10 ? '0' : '') + n; }
+        return p(d.getUTCMonth() + 1) + '/' + p(d.getUTCDate()) + '/' + d.getUTCFullYear() +
+          ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+      }),
+      enumerable: true, configurable: true,
+    });
     'anchors applets embeds links images forms'.split(' ').forEach(function(coll) {
       if (!(coll in Document.prototype)) {
         Object.defineProperty(Document.prototype, coll, {
@@ -21654,7 +21655,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   };
   var _gl1Params = {
     0x1F02: 'WebGL 1.0 (OpenGL ES 2.0 Chromium)',
-    0x8B8C: 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0.0 Chromium)',
+    0x8B8C: 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)',
     0x1F00: 'WebKit', 0x1F01: 'WebKit WebGL',
     0x9245: 'Google Inc. (Intel)',
     0x9246: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',

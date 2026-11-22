@@ -8404,9 +8404,11 @@ mod tests {
             performance.mark('other', {startTime: 2});
             performance.measure('same', {start: 1, end: 3});
             performance.clearMarks('same');
-            const before = performance.getEntries().map(e => e.entryType + ':' + e.name);
+            const user = () => performance.getEntries()
+                .filter(e => e.entryType === 'mark' || e.entryType === 'measure');
+            const before = user().map(e => e.entryType + ':' + e.name);
             performance.clearMeasures();
-            return [before, performance.getEntries().map(e => e.name)];
+            return [before, user().map(e => e.name)];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([["measure:same", "mark:other"], ["other"]]));
     }
@@ -8431,7 +8433,8 @@ mod tests {
                 () => performance.getEntriesByName(),
                 () => new PerformanceEntry(), () => new PerformanceMeasure(),
             ].map(fn => { try { fn(); return 'none'; } catch (error) { return error.name; } });
-            return [errors, performance.getEntries().length];
+            return [errors, performance.getEntries()
+                .filter(e => e.entryType === 'mark' || e.entryType === 'measure').length];
         })()"#).unwrap();
         assert_eq!(result, serde_json::json!([[
             "TypeError", "TypeError", "SyntaxError", "TypeError", "TypeError", "DataCloneError",
