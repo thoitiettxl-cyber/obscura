@@ -8871,9 +8871,69 @@ fn op_frame_name(state: &OpState, context_id: u32, #[string] value: Option<Strin
     })
 }
 
+/// Codec bridge for `CompressionStream`/`DecompressionStream`. Formats follow
+/// the Compression Streams spec: "gzip" (RFC 1952), "deflate" (zlib, RFC 1950),
+/// and "deflate-raw" (RFC 1951). The JS wrapper buffers a stream's chunks and
+/// transforms the whole payload per call, so one-shot encode/decode is enough.
+#[op2]
+#[string]
+fn op_compress(
+    #[string] direction: &str,
+    #[string] format: &str,
+    #[string] data_b64: &str,
+) -> Result<String, deno_error::JsErrorBox> {
+    use std::io::{Read, Write};
+    let data = BASE64
+        .decode(data_b64)
+        .map_err(|e| deno_error::JsErrorBox::type_error(format!("Invalid binary input: {e}")))?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<Vec<u8>> {
+        match (direction, format) {
+            ("compress", "gzip") => {
+                let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("compress", "deflate") => {
+                let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("compress", "deflate-raw") => {
+                let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("decompress", "gzip") => {
+                let mut out = Vec::new();
+                flate2::read::GzDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            ("decompress", "deflate") => {
+                let mut out = Vec::new();
+                flate2::read::ZlibDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            ("decompress", "deflate-raw") => {
+                let mut out = Vec::new();
+                flate2::read::DeflateDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported {direction} format: {format}"),
+            )),
+        }
+    }));
+    let out = result
+        .map_err(|_| deno_error::JsErrorBox::generic("compression failed"))?
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    Ok(BASE64.encode(out))
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_compress(),
         op_form_owner(),
         op_form_cache_buffer(),
         op_create_select_allocator(),
