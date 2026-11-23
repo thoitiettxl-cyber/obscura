@@ -4,6 +4,7 @@ pub use document_progress::{DocumentInterruption, DocumentProgress, DocumentRequ
 pub mod cookies;
 pub mod cookie_import;
 pub mod geoip;
+pub mod inflight;
 pub mod encoding;
 pub mod websocket;
 pub mod interceptor;

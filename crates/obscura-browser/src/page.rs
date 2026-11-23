@@ -3793,21 +3793,31 @@ impl Page {
                     robots_url.set_path("/robots.txt");
                     robots_url.set_query(None);
                     robots_url.set_fragment(None);
-                    let body = match self
-                        .http_client
-                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                        .await
-                    {
-                        Ok(resp) if resp.status == 200 => {
-                            String::from_utf8_lossy(&resp.body).into_owned()
-                        }
-                        _ => String::new(),
-                    };
-                    self.context.robots_cache.parse_and_store(
-                        &origin,
-                        &body,
-                        &self.context.user_agent,
-                    );
+                    let robots_cache = &self.context.robots_cache;
+                    robots_cache
+                        .load_once(&origin, || async {
+                            // The entry may have been stored by a concurrent
+                            // navigation between our contains() check and
+                            // leader election.
+                            if !robots_cache.contains(&origin) {
+                                let body = match self
+                                    .http_client
+                                    .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
+                                    .await
+                                {
+                                    Ok(resp) if resp.status == 200 => {
+                                        String::from_utf8_lossy(&resp.body).into_owned()
+                                    }
+                                    _ => String::new(),
+                                };
+                                robots_cache.parse_and_store(
+                                    &origin,
+                                    &body,
+                                    &self.context.user_agent,
+                                );
+                            }
+                        })
+                        .await;
                 }
 
                 if !self.context.robots_cache.is_allowed(&origin, url.path()) {
