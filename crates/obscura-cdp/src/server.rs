@@ -28,6 +28,9 @@ struct PendingRuntimeReply {
     session_id: Option<String>,
     reply_tx: mpsc::UnboundedSender<String>,
     evaluation: crate::domains::runtime::DeferredEvaluation,
+    /// Page leased for the idle-page reaper while this evaluation is in
+    /// flight (camofox's page-lease guard).
+    leased_page: Option<String>,
 }
 
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
@@ -1348,12 +1351,29 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
     let mut idle_pages = HashSet::new();
     let mut pending_runtime = Vec::<PendingRuntimeReply>::new();
+    // Per-connection idle-page reaper (port of camofox's per-tab inactivity
+    // reaper): pages untouched for OBSCURA_PAGE_IDLE_MS are closed through
+    // the same path as Target.closeTarget, so clients see the usual
+    // detachedFromTarget/targetDestroyed events. Off when the env var is
+    // unset or 0; camofox's service default is 300000 (TAB_INACTIVITY_MS).
+    let page_idle_timeout = std::env::var("OBSCURA_PAGE_IDLE_MS").ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    let reap_interval_ms = std::env::var("OBSCURA_PAGE_REAP_INTERVAL_MS").ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60_000);
+    let mut reap_tick = tokio::time::interval(std::time::Duration::from_millis(reap_interval_ms.max(1)));
+    reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let mut index = 0;
         while index < pending_runtime.len() {
             if !pending_runtime[index].evaluation.ready(&mut ctx) { index += 1; continue; }
             let pending = pending_runtime.remove(index);
+            if let Some(page_id) = &pending.leased_page {
+                ctx.release_page_lease(page_id);
+            }
             let _guard = ctx.v8_lock.clone().lock_owned().await;
             let result = pending.evaluation.finish(&mut ctx, &pending.session_id).await;
             idle_pages.clear();
@@ -1478,6 +1498,16 @@ async fn cdp_processor(
                     ).await;
                     idle_pages.clear();
                     runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    None
+                },
+                _ = reap_tick.tick(), if page_idle_timeout.is_some() => {
+                    let closed = dispatch::reap_idle_pages(&mut ctx, page_idle_timeout.unwrap());
+                    if !closed.is_empty() {
+                        tracing::info!("idle page reaper closed {} page(s): {}", closed.len(), closed.join(", "));
+                    }
+                    idle_pages.clear();
+                    runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     None
                 }
             }
@@ -2355,8 +2385,12 @@ async fn process_cdp_message_with_pending(
     }
 
     if let (Some(evaluation), Some(pending)) = (evaluation, pending_runtime) {
+        // Lease the page so the idle reaper cannot close it mid-evaluation.
+        ctx.acquire_page_lease(&evaluation.page_id);
+        let leased_page = Some(evaluation.page_id.clone());
         pending.push(PendingRuntimeReply {
             id: req.id, session_id: req.session_id, reply_tx: reply_tx.clone(), evaluation,
+            leased_page,
         });
     } else {
         if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }

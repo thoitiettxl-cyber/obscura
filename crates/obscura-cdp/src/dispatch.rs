@@ -70,6 +70,14 @@ pub struct CdpContext {
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
+    /// Per-page time of the last CDP command routed to it (through one of
+    /// its sessions, or by target id for Target.* calls). Feeds the
+    /// idle-page reaper; see `reap_idle_pages`.
+    pub page_last_activity: HashMap<String, std::time::Instant>,
+    /// Refcounted leases keeping a page out of the idle reaper while a
+    /// deferred command (an awaited Runtime.evaluate) is still in flight —
+    /// camofox's page-lease / isEvaluating guard.
+    pub page_leases: HashMap<String, u32>,
     pub pending_events: Vec<CdpEvent>,
     pub(crate) dom_documents: HashMap<Option<String>, domains::dom::DomDocument>,
     pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
@@ -191,6 +199,8 @@ impl CdpContext {
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
+            page_last_activity: HashMap::new(),
+            page_leases: HashMap::new(),
             pending_events: Vec::new(),
             dom_documents: HashMap::new(),
             pending_beforeunload_close: HashMap::new(),
@@ -278,6 +288,7 @@ impl CdpContext {
         let mut page = Page::new(page_id.clone(), context);
         page.navigate_blank();
         self.pages.push(page);
+        self.page_last_activity.insert(page_id.clone(), std::time::Instant::now());
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
         self.lifecycle_timestamps.insert(page_id.clone(), [Some(domains::page::timestamp()); 5]);
@@ -379,6 +390,8 @@ impl CdpContext {
             .map(|(session_id, _)| session_id.clone())
             .collect();
         self.pages.retain(|p| p.id != id);
+        self.page_last_activity.remove(id);
+        self.page_leases.remove(id);
         self.current_loader_ids.remove(id);
         self.lifecycle_timestamps.remove(id);
         self.nav_events_emitted.remove(id);
@@ -406,6 +419,20 @@ impl CdpContext {
         self.page_isolated_worlds.remove(id);
         self.sessions.retain(|_, v| v != id);
         self.interrupt_routes.lock().unwrap().retain(|_, page| page != id);
+    }
+
+    /// Keep `page_id` out of the idle reaper until `release_page_lease`.
+    pub(crate) fn acquire_page_lease(&mut self, page_id: &str) {
+        *self.page_leases.entry(page_id.to_string()).or_insert(0) += 1;
+    }
+
+    pub(crate) fn release_page_lease(&mut self, page_id: &str) {
+        if let Some(count) = self.page_leases.get_mut(page_id) {
+            *count -= 1;
+            if *count == 0 {
+                self.page_leases.remove(page_id);
+            }
+        }
     }
 
     fn allocate_context(
@@ -784,6 +811,38 @@ fn is_v8_free_method(method: &str) -> bool {
     )
 }
 
+/// Per-connection idle-page reaper (port of camofox's per-tab inactivity
+/// reaper in server.js): close pages untouched for `timeout` so a client
+/// that never closes its targets cannot leak this connection's pages —
+/// and their isolates — indefinitely. Pages holding a lease (an in-flight
+/// deferred evaluation) are skipped, matching camofox's isEvaluating /
+/// page-lease guard. Closing goes through `close_target` so subscribers get
+/// the usual Target.detachedFromTarget/targetDestroyed events. Returns the
+/// reaped target ids.
+///
+/// camofox also fast-reaps crashed pages (<=60s); obscura has no crashed
+/// marker — a watchdog-terminated isolate keeps serving later scripts and
+/// has_js() == false means a suspended page, not a dead one — so no
+/// shortened deadline applies here.
+pub(crate) fn reap_idle_pages(ctx: &mut CdpContext, timeout: std::time::Duration) -> Vec<String> {
+    let now = std::time::Instant::now();
+    let stale: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| !ctx.page_leases.contains_key(&page.id))
+        .filter(|page| {
+            ctx.page_last_activity
+                .get(&page.id)
+                .is_some_and(|t| now.duration_since(*t) >= timeout)
+        })
+        .map(|page| page.id.clone())
+        .collect();
+    for id in &stale {
+        domains::target::close_target(ctx, id);
+    }
+    stale
+}
+
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     dispatch_with_deferred(req, ctx, None).await
 }
@@ -799,6 +858,18 @@ pub(crate) async fn dispatch_with_deferred(
     // inner call, and tokio Mutex is not reentrant.
     if req.method == "Target.sendMessageToTarget" {
         return dispatch_send_message_to_target(req, ctx).await;
+    }
+
+    // Idle-page reaper bookkeeping: any command routed to a page (through a
+    // session, or by target id for Target.* calls) counts as activity.
+    if let Some(page_id) = req
+        .session_id
+        .as_deref()
+        .and_then(|sid| ctx.sessions.get(sid))
+        .cloned()
+        .or_else(|| req.params.get("targetId").and_then(|v| v.as_str()).map(str::to_owned))
+    {
+        ctx.page_last_activity.insert(page_id, std::time::Instant::now());
     }
 
     // Issue #430: keep this connection's V8 work serialized on its own thread.
@@ -1364,6 +1435,51 @@ mod tests {
         assert!(ctx.lifecycle_timestamps.is_empty());
         assert!(!ctx.binding_sessions.contains_key("only"));
         assert_eq!(ctx.binding_sessions["shared"], vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn idle_reaper_closes_stale_pages_and_reports_events() {
+        let mut ctx = CdpContext::new();
+        let fresh = ctx.create_page();
+        let stale = ctx.create_page();
+        ctx.sessions.insert("stale-session".into(), stale.clone());
+        *ctx.page_last_activity.get_mut(&stale).unwrap() -= std::time::Duration::from_secs(120);
+
+        let reaped = reap_idle_pages(&mut ctx, std::time::Duration::from_secs(60));
+
+        assert_eq!(reaped, vec![stale.clone()]);
+        assert!(ctx.pages.iter().all(|p| p.id != stale));
+        assert!(ctx.pages.iter().any(|p| p.id == fresh));
+        assert!(ctx.page_last_activity.get(&stale).is_none());
+        let methods: Vec<&str> = ctx.pending_events.iter().map(|e| e.method.as_str()).collect();
+        assert!(methods.contains(&"Target.detachedFromTarget"));
+        assert!(methods.contains(&"Target.targetDestroyed"));
+    }
+
+    #[test]
+    fn idle_reaper_skips_leased_and_recent_pages() {
+        let mut ctx = CdpContext::new();
+        let leased = ctx.create_page();
+        let recent = ctx.create_page();
+        for id in [&leased, &recent] {
+            *ctx.page_last_activity.get_mut(id).unwrap() -= std::time::Duration::from_secs(120);
+        }
+        ctx.acquire_page_lease(&leased);
+        ctx.page_last_activity.insert(recent.clone(), std::time::Instant::now());
+
+        assert!(reap_idle_pages(&mut ctx, std::time::Duration::from_secs(60)).is_empty());
+        ctx.release_page_lease(&leased);
+        // The lease drops only when the refcount hits zero.
+        ctx.acquire_page_lease(&leased);
+        ctx.acquire_page_lease(&leased);
+        ctx.release_page_lease(&leased);
+        assert!(ctx.page_leases.contains_key(&leased));
+        ctx.release_page_lease(&leased);
+        assert!(!ctx.page_leases.contains_key(&leased));
+
+        // With the lease gone the stale page is reapable; the recent one stays.
+        let reaped = reap_idle_pages(&mut ctx, std::time::Duration::from_secs(60));
+        assert_eq!(reaped, vec![leased]);
     }
 
     #[tokio::test(flavor = "current_thread")]
