@@ -4727,6 +4727,31 @@ impl Page {
         self.dom.as_ref()
     }
 
+    /// Convert the live DOM to Markdown through the native `obscura-html2md`
+    /// state machine. Render builds resolve computed styles first, so
+    /// `display: none`/`visibility: hidden` subtrees are dropped and block
+    /// boundaries from stylesheets (e.g. `display: block` links) are kept;
+    /// other builds fall back to structural conversion. Runs without a live
+    /// JS runtime and cannot be monkey-patched by the page.
+    pub fn markdown(&self) -> String {
+        let styles = self.markdown_styles();
+        self.with_dom(|dom| crate::markdown::render(dom, &styles))
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "render")]
+    fn markdown_styles(&self) -> std::collections::HashMap<obscura_dom::NodeId, obscura_js::runtime::MarkdownStyle> {
+        self.js
+            .as_ref()
+            .map(|js| js.markdown_styles())
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(feature = "render"))]
+    fn markdown_styles(&self) -> std::collections::HashMap<obscura_dom::NodeId, obscura_js::runtime::MarkdownStyle> {
+        Default::default()
+    }
+
     /// V8 isolate handle for this page's runtime, if it has been initialized.
     /// Lets the CDP dispatcher arm a per-command watchdog (which bounds any one
     /// command so a hung page cannot hold this connection's V8 lock forever)

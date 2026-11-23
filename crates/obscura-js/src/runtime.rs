@@ -212,6 +212,15 @@ pub struct AccessibilityStyle {
     pub visibility_hidden: Option<bool>,
 }
 
+/// Computed display/visibility values the DOM→Markdown converter needs to
+/// keep block boundaries from stylesheets and drop hidden subtrees.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct MarkdownStyle {
+    pub display: String,
+    pub visibility: String,
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum HistoryUpdate {
@@ -4603,6 +4612,63 @@ impl ObscuraJsRuntime {
                         visibility_hidden: style.visibility_hidden,
                     },
                 )
+            })
+            .collect()
+    }
+
+    /// Per-element computed display/visibility for the DOM→Markdown adapter.
+    /// Follows `accessibility_styles`: the non-geometric cascade covers the
+    /// common case without forcing layout; animated pages fall back to the
+    /// prepared frame.
+    #[cfg(feature = "render")]
+    pub fn markdown_styles(&self) -> HashMap<NodeId, MarkdownStyle> {
+        let mut state = self.state.borrow_mut();
+        crate::ops::sample_live_document_animations(&mut state);
+        if state.animation_timeline.waapi_nodes().is_empty() {
+            let mut cascade = state.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::NonGeometricStyleCache::new(
+                    dom,
+                    state.viewport,
+                    state.render_media,
+                    &state.stylesheet_cache,
+                )
+            });
+            if let (Some(dom), Some(cascade)) = (state.dom.as_ref(), cascade.as_mut()) {
+                let mut styles = HashMap::new();
+                for id in dom.descendants(dom.document()) {
+                    if !dom.with_node(id, |node| node.is_element()).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(snapshot) = cascade.resolve(dom, id, "display") {
+                        styles.insert(
+                            id,
+                            MarkdownStyle {
+                                display: snapshot.get("display").cloned().unwrap_or_default(),
+                                visibility: snapshot.get("visibility").cloned().unwrap_or_default(),
+                            },
+                        );
+                    }
+                }
+                return styles;
+            }
+        }
+        let Some(prepared) = crate::ops::ensure_prepared_render(&mut state) else {
+            return HashMap::new();
+        };
+        prepared
+            .layout()
+            .styles
+            .iter()
+            .filter_map(|(id, _)| {
+                prepared.computed_style(*id).map(|snapshot| {
+                    (
+                        *id,
+                        MarkdownStyle {
+                            display: snapshot.get("display").cloned().unwrap_or_default(),
+                            visibility: snapshot.get("visibility").cloned().unwrap_or_default(),
+                        },
+                    )
+                })
             })
             .collect()
     }
@@ -27458,189 +27524,6 @@ mod tests {
                 "2"
             ])
         );
-    }
-
-    #[test]
-    fn test_html_to_markdown_deep_dom() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        rt.evaluate(r#"(() => {
-            let child = document.createTextNode('deep leaf');
-            for (let i = 0; i < 12000; i++) {
-                const parent = document.createElement('span');
-                parent.appendChild(child);
-                child = parent;
-            }
-            document.body.appendChild(child);
-        })()"#).unwrap();
-        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!("deep leaf"));
-    }
-
-    #[test]
-    fn test_html_to_markdown_deep_tables() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        rt.evaluate(r#"(() => {
-            let child = document.createTextNode('leaf');
-            for (let i = 0; i < 180; i++) {
-                const table = document.createElement('table');
-                const row = document.createElement('tr');
-                const cell = document.createElement('td');
-                cell.appendChild(child);
-                row.appendChild(cell);
-                table.appendChild(row);
-                child = table;
-            }
-            document.body.appendChild(child);
-        })()"#).unwrap();
-        let expected = format!("{}leaf{}", "| ".repeat(180), " |".repeat(180));
-        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!(expected));
-    }
-
-    #[test]
-    fn test_html_to_markdown_deep_subtree_formatting() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        for depth in [127, 128, 129, 130] {
-            rt.evaluate(&format!(r#"(() => {{
-                document.body.innerHTML = '';
-                let child = document.createElement('span');
-                child.innerHTML = '<h1>Title</h1><p>Hello <strong>world</strong></p><table><tr><td>A</td><td>B</td></tr></table>';
-                for (let i = 0; i < {depth}; i++) {{
-                    const parent = document.createElement('span');
-                    parent.appendChild(child);
-                    child = parent;
-                }}
-                document.body.appendChild(child);
-            }})()"#)).unwrap();
-            assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(),
-                serde_json::json!("# Title\n\nHello **world**\n\n| A | B |"), "depth {depth}");
-        }
-    }
-
-    #[test]
-    fn test_html_to_markdown_row_ignores_non_element_children() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        rt.evaluate(r#"(() => {
-            const table = document.createElement('table');
-            const row = document.createElement('tr');
-            row.appendChild(document.createTextNode('ignored'));
-            row.appendChild(document.createComment('ignored'));
-            const cell = document.createElement('td');
-            cell.textContent = 'A';
-            row.appendChild(cell);
-            const span = document.createElement('span');
-            span.textContent = 'B';
-            row.appendChild(span);
-            table.appendChild(row);
-            document.body.appendChild(table);
-        })()"#).unwrap();
-        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!("| A | B |"));
-    }
-
-    #[test]
-    fn test_html_to_markdown_visits_nested_table_elements_once() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        let expected_reads = rt.evaluate(r#"(() => {
-            let child = document.createTextNode('leaf');
-            for (let i = 0; i < 12; i++) {
-                const table = document.createElement('table');
-                const row = document.createElement('tr');
-                const cell = document.createElement('td');
-                cell.appendChild(child);
-                row.appendChild(cell);
-                table.appendChild(row);
-                child = table;
-            }
-            document.body.appendChild(child);
-            const expected = document.body.querySelectorAll('*').length + 1;
-            const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'childNodes');
-            globalThis.markdownChildReads = 0;
-            Object.defineProperty(Node.prototype, 'childNodes', {
-                configurable: true,
-                get() {
-                    markdownChildReads++;
-                    return descriptor.get.call(this);
-                }
-            });
-            return expected;
-        })()"#).unwrap();
-        let md = rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap();
-        assert!(md.as_str().unwrap().contains("leaf"));
-        assert_eq!(rt.evaluate("markdownChildReads").unwrap(), expected_reads);
-    }
-
-    #[test]
-    fn test_html_to_markdown_table_output() {
-        let mut rt = setup_runtime(
-            "<html><body><table><tr><th>A</th><th>B</th></tr><tr><td>one <strong>bold</strong></td><td><a href='/two'>two</a></td></tr></table><p>tail</p></body></html>",
-        );
-        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(),
-            serde_json::json!("| A | B |\n| one **bold** | [two](/two) |\n\ntail"));
-    }
-
-    #[test]
-    fn test_html_to_markdown_headings() {
-        let mut rt =
-            setup_runtime("<html><body><h1>Title</h1><h2>Sub</h2><p>Body</p></body></html>");
-        let md = rt
-            .evaluate(crate::HTML_TO_MARKDOWN_JS)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(md.contains("# Title"), "missing H1: {}", md);
-        assert!(md.contains("## Sub"), "missing H2: {}", md);
-        assert!(md.contains("Body"), "missing paragraph text: {}", md);
-    }
-
-    #[test]
-    fn test_html_to_markdown_links_and_inline() {
-        let mut rt = setup_runtime(
-            r#"<html><body><p>Hello <strong>world</strong> <a href="https://x.test/">link</a> <em>em</em></p></body></html>"#,
-        );
-        let md = rt
-            .evaluate(crate::HTML_TO_MARKDOWN_JS)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(md.contains("**world**"), "missing strong: {}", md);
-        assert!(md.contains("*em*"), "missing em: {}", md);
-        assert!(
-            md.contains("[link](https://x.test/)"),
-            "missing link: {}",
-            md
-        );
-    }
-
-    #[test]
-    fn test_html_to_markdown_lists() {
-        let mut rt = setup_runtime(
-            "<html><body><ul><li>A</li><li>B</li></ul><ol><li>X</li><li>Y</li></ol></body></html>",
-        );
-        let md = rt
-            .evaluate(crate::HTML_TO_MARKDOWN_JS)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(md.contains("- A"), "missing unordered A: {}", md);
-        assert!(md.contains("- B"), "missing unordered B: {}", md);
-        assert!(md.contains("1. X"), "missing ordered X: {}", md);
-    }
-
-    #[test]
-    fn test_html_to_markdown_skips_script_and_style() {
-        let mut rt = setup_runtime(
-            "<html><body><p>Text</p><script>alert(1)</script><style>body{color:red}</style></body></html>",
-        );
-        let md = rt
-            .evaluate(crate::HTML_TO_MARKDOWN_JS)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(md.contains("Text"), "missing visible text: {}", md);
-        assert!(!md.contains("alert"), "leaked script content: {}", md);
-        assert!(!md.contains("color:red"), "leaked style content: {}", md);
     }
 
     #[test]

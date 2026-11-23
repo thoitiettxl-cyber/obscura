@@ -1945,8 +1945,7 @@ fn dump_text(page: &mut Page) -> String {
 }
 
 fn dump_markdown(page: &mut Page) -> String {
-    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
-    result.as_str().unwrap_or_default().to_string()
+    page.markdown()
 }
 
 fn is_html_whitespace(c: char) -> bool {
