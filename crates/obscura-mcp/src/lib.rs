@@ -364,6 +364,10 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                             "type": "string",
                             "enum": ["load", "domcontentloaded", "networkidle0"],
                             "description": "Navigation wait condition (default: load)"
+                        },
+                        "dismissConsent": {
+                            "type": "boolean",
+                            "description": "Opt-in: after load, click a visible button of a known consent manager (OneTrust, Cookiebot, Quantcast) to dismiss its banner (default: false)"
                         }
                     },
                     "required": ["url"]
@@ -1120,9 +1124,38 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
             message
         })?;
 
-    let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
+    let dismissed = args.get("dismissConsent").and_then(Value::as_bool).unwrap_or(false)
+        .then(|| page.evaluate(DISMISS_CONSENT_SCRIPT).as_str().map(str::to_string))
+        .flatten();
+
+    let mut summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
+    if let Some(selector) = dismissed {
+        summary.push_str(&format!("\nDismissed consent dialog via {selector}"));
+    }
     Ok(summary)
 }
+
+// Restrict this opt-in behavior to consent-manager controls (camofox
+// dismissConsentDialogs): broad dialog/modal selectors could close
+// application UI unrelated to consent. Clicks the first visible match only.
+const DISMISS_CONSENT_SCRIPT: &str = r#"(function(){
+  var selectors = [
+    '#onetrust-banner-sdk #onetrust-accept-btn-handler',
+    '#onetrust-banner-sdk #onetrust-reject-all-handler',
+    '#onetrust-banner-sdk #onetrust-close-btn-container button',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonDecline',
+    '#qc-cmp2-ui button[mode="primary"]'
+  ];
+  for (var i = 0; i < selectors.length; i++) {
+    var el = document.querySelector(selectors[i]);
+    if (el && (typeof el.checkVisibility !== 'function' || el.checkVisibility({checkVisibilityCSS: true}))) {
+      el.click();
+      return selectors[i];
+    }
+  }
+  return null;
+})()"#;
 
 fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
@@ -3471,6 +3504,37 @@ mod tests {
         restored.page_mut().navigate(&origin).await.expect("restored page");
         assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
             json!(["\0\"value\"", "\0session"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consent_dismissal_is_opt_in_and_only_targets_consent_managers() {
+        let banner = "<div id=onetrust-banner-sdk><button id=onetrust-accept-btn-handler onclick=\"window.consent='accepted'\">Accept</button></div>";
+
+        // Opt-in clicks the consent control.
+        let mut state = BrowserState::new(None, None, false);
+        tool_navigate(&json!({"url": format!("data:text/html,{banner}"), "dismissConsent": true}), &mut state)
+            .await.expect("navigate");
+        assert_eq!(state.page_mut().evaluate("window.consent"), json!("accepted"));
+
+        // Same banner without the flag is left alone.
+        let mut state = BrowserState::new(None, None, false);
+        tool_navigate(&json!({"url": format!("data:text/html,{banner}")}), &mut state)
+            .await.expect("navigate");
+        assert_eq!(state.page_mut().evaluate("window.consent"), Value::Null);
+
+        // A hidden banner is not clicked.
+        let hidden = format!("<div style=\"display:none\">{banner}</div>");
+        let mut state = BrowserState::new(None, None, false);
+        tool_navigate(&json!({"url": format!("data:text/html,{hidden}"), "dismissConsent": true}), &mut state)
+            .await.expect("navigate");
+        assert_eq!(state.page_mut().evaluate("window.consent"), Value::Null);
+
+        // An ordinary "Accept" button outside consent-manager markup is untouched.
+        let plain = "<button onclick=\"window.consent='wrong'\">Accept cookies</button>";
+        let mut state = BrowserState::new(None, None, false);
+        tool_navigate(&json!({"url": format!("data:text/html,{plain}"), "dismissConsent": true}), &mut state)
+            .await.expect("navigate");
+        assert_eq!(state.page_mut().evaluate("window.consent"), Value::Null);
     }
 
     #[tokio::test(flavor = "current_thread")]
