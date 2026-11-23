@@ -1,4 +1,5 @@
 pub mod accessibility;
+mod markdown;
 pub mod context;
 mod fork_virtual_url;
 mod idle_deadline;
@@ -10,7 +11,6 @@ pub mod profiles;
 
 pub use context::BrowserContext;
 pub use lifecycle::{LifecycleState, WaitUntil};
-pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]
 pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,

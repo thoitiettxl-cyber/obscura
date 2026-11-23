@@ -1382,9 +1382,7 @@ fn tool_markdown(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
         .unwrap_or(DEFAULT_TEXT_LIMIT);
     let page = state.page_mut();
-    let result = evaluate_tool_script(page, obscura_browser::HTML_TO_MARKDOWN_JS)?;
-    let md = result.as_str().unwrap_or_default();
-    Ok(truncate(md, max_chars))
+    Ok(truncate(&page.markdown(), max_chars))
 }
 
 /// Enumerate every `<a href>` on the page. One JSON object per line so
