@@ -29,7 +29,7 @@ base64 = { workspace = true }
 # Browser-profile cookie import (cookie_import.rs). rusqlite is bundled so no
 # system SQLite is needed; the RustCrypto crates cover Chrome's v10/v11
 # AES-GCM values and the AES-128-CBC key wrap in Local State.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 aes-gcm = "0.10"
