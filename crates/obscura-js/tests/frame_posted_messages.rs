@@ -7,7 +7,7 @@ async fn frame_posted_task_messages_keep_the_senders_origin_and_target() {
     parent.set_dom(parse_html("<html><body></body></html>"));
     parent.set_url("https://parent.example/");
     parent.run_page_init();
-    let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+    let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
         "<html><body></body></html>").expect("frame realm");
     frame.execute_script(&mut parent, r#"
         scheduler.postTask(() => parent.postMessage('from-frame-task', '*'));

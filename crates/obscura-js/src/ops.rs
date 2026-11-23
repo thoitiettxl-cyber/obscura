@@ -7671,25 +7671,25 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
-/// Initial blank and srcdoc documents share their creator's realm setup.
-/// reentrant: the initialize callback synchronously bootstraps the child
-/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
-/// re-entrancy check aborts the whole process.
-#[op2(reentrant)]
-fn op_initial_frame(
-    scope: &mut v8::PinScope,
+/// Claims a frame identity for an `about:blank`/`about:srcdoc` iframe without
+/// building its V8 realm. The realm only exists once script actually reaches
+/// into the frame (`contentWindow`, `contentDocument`, a posted message), so
+/// documents that plant many scriptless frames pay no context at all. The
+/// pending-frame record still drives Page adoption, `frame_urls`, and the
+/// event-loop wake, exactly as an eagerly built realm did.
+#[op2(fast)]
+fn op_declare_frame(
     state: &OpState,
     parent_frame_id: u32,
-    initialize: v8::Local<v8::Function>,
     owner_node: u32,
-    #[string] srcdoc: Option<String>,
+    is_srcdoc: bool,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
         let parent_state = frame_state(state, parent_frame_id);
-        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
-        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
+        let frame_url = if is_srcdoc { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len();
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
             || page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
@@ -7698,6 +7698,60 @@ fn op_initial_frame(
         }
         let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
         page.borrow_mut().frame_id_counter = frame_id;
+        registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        let mut page = page.borrow_mut();
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
+        page.pending_frames.push(PendingFrame {
+            frame_id,
+            parent_frame_id,
+            url: frame_url.to_string(),
+            html: String::new(),
+            viewport_width: 300,
+            viewport_height: 150,
+        });
+        frame_id
+    })).unwrap_or(0)
+}
+
+/// Initial blank and srcdoc documents share their creator's realm setup.
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+///
+/// `declared_frame_id` reuses an id claimed earlier with `op_declare_frame`:
+/// the pending-frame record and owner bookkeeping already exist, so only the
+/// realm itself is built here.
+#[op2(reentrant)]
+fn op_initial_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    parent_frame_id: u32,
+    initialize: v8::Local<v8::Function>,
+    owner_node: u32,
+    #[string] srcdoc: Option<String>,
+    declared_frame_id: u32,
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let page = state.borrow::<SharedState>().clone();
+        let parent_state = frame_state(state, parent_frame_id);
+        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
+        let declared = declared_frame_id != 0;
+        if registry.borrow().live_count() >= max_live_frames()
+            || (!declared && page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS)
+            || (!declared
+                && page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES)
+        {
+            return 0;
+        }
+        let frame_id = if declared {
+            declared_frame_id
+        } else {
+            let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
+            page.borrow_mut().frame_id_counter = frame_id;
+            frame_id
+        };
         let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
         let main_context = scope.get_current_context();
         let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
@@ -7745,7 +7799,9 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        if !declared {
+            registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        }
         registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
@@ -7758,16 +7814,18 @@ fn op_initial_frame(
         // Initialization needs the creator's token; author code must never
         // retain it when the sandbox requires an opaque origin.
         if opaque { context.use_default_security_token(); }
-        let mut page = page.borrow_mut();
-        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
-        page.pending_frames.push(PendingFrame {
-            frame_id,
-            parent_frame_id,
-            url: frame_url.to_string(),
-            html: String::new(),
-            viewport_width: 300,
-            viewport_height: 150,
-        });
+        if !declared {
+            let mut page = page.borrow_mut();
+            page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
+            page.pending_frames.push(PendingFrame {
+                frame_id,
+                parent_frame_id,
+                url: frame_url.to_string(),
+                html: String::new(),
+                viewport_width: 300,
+                viewport_height: 150,
+            });
+        }
         frame_id
     })).unwrap_or(0)
 }
@@ -9084,6 +9142,7 @@ pub fn build_extension() -> Extension {
         op_history_traverse(),
         op_frame_document_ready(),
         op_initial_frame(),
+        op_declare_frame(),
         op_connect_frame(),
         op_frame_context(),
         op_frame_relation(),

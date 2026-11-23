@@ -278,7 +278,7 @@ _nativeFnAdd(_functionToString);
   // resolved lazily (this block runs before its class declaration).
   function _isDom(t) {
     if (!t || (typeof t !== 'object' && typeof t !== 'function') || _isGlobal(t)) { return false; }
-    try { return typeof t._nid === 'number'; } catch (e) { return false; }
+    try { return t instanceof Node; } catch (e) { return false; }
   }
   function _hiddenName(name) { return typeof name === 'string' && name.charCodeAt(0) === 95; }
   function _filter(t, names) {
@@ -2563,7 +2563,14 @@ function __prepareInsertedSubtree(root) {
       else {
         const src = script.getAttribute('src');
         if (src && src !== 'about:blank') script._loadIframeSrc(src);
-        else if (_ensureInitialFrameRealm(script)) script.dispatchEvent(new Event('load'));
+        else {
+          // Declare only: a scriptless about:blank frame pays a V8 realm
+          // restore for nothing. contentWindow, contentDocument, and window[i]
+          // materialize the realm on first access; the element's own load
+          // event still fires on schedule.
+          _declareInitialFrame(script);
+          script.dispatchEvent(new Event('load'));
+        }
       }
     } else __prepareInsertedScript(script);
   }
@@ -5470,7 +5477,7 @@ class Element extends Node {
   _loadIframeSrc(url, submission) {
     _connectFrameContext(this);
     if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
-    if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _ensureInitialFrameRealm(this); return; }
+    if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _declareInitialFrame(this); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -5556,7 +5563,13 @@ class Element extends Node {
       this._iframeSrcdocTaskPending = false;
       if (!this.isConnected || this._iframeLoadingUrl !== 'about:srcdoc' || !this.hasAttribute('srcdoc')) return;
       if (this._frameId) globalThis.__obscura_forgetFrame(this._frameId);
+      // The initial blank realm may have materialized on an early
+      // contentDocument read; clear the whole declared state so the srcdoc
+      // navigation builds its own realm instead of keeping the blank one.
       this._frameId = 0;
+      this._frameDeclared = false;
+      this._iframeRealm = false;
+      this._iframeOpaque = false;
       _ensureInitialFrameRealm(this, this._iframeSrcdoc);
       this._iframeLoadedUrl = 'about:srcdoc';
     }, _schedulerPriorityRank['user-visible'] * 2, _browserPostedTaskGeneration(), () => {
@@ -17122,15 +17135,43 @@ function _connectInsertedResources(root, html) {
   }
 }
 
-function _ensureInitialFrameRealm(element, srcdoc) {
-  if (element._frameId || !element.isConnected) return;
+// Claims a frame id and context for an initial-document iframe without paying
+// for a V8 realm. Realms are materialized by _ensureInitialFrameRealm on the
+// first script touch (contentWindow, contentDocument, window[i]), so a page
+// that plants scriptless frames keeps only the cheap bookkeeping.
+function _declareInitialFrame(element, srcdoc) {
+  if (element._frameId) return element._frameId;
+  if (!element.isConnected) return 0;
+  // An opaque sandbox must never receive the creator's security token; an
+  // opaque blank frame is served by the remote window surface instead.
+  if (element.hasAttribute('sandbox') && srcdoc === undefined &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin')) {
+    element._iframeOpaque = true;
+    return 0;
+  }
   _connectFrameContext(element);
   _syncWindowIndices();
-  // An opaque sandbox must never receive the creator's security token.
-  let opaque = element.hasAttribute('sandbox') &&
-      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
-  if (opaque && srcdoc === undefined) return false;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
+  const frameId = __obscuraCore.ops.op_declare_frame(_realmFrameId, element._nid,
+      srcdoc !== undefined);
+  if (!frameId) return 0;
+  element._frameId = frameId;
+  element._frameDeclared = true;
+  globalThis.__obscura_frameElements[frameId] = element;
+  return frameId;
+}
+
+function _ensureInitialFrameRealm(element, srcdoc) {
+  if (element._iframeRealm) return true;
+  if (!_declareInitialFrame(element, srcdoc)) return false;
+  // A frame id that op_frame_document_ready assigned belongs to a fetched
+  // document: its realm is built by the host adoption path, never by
+  // op_initial_frame's blank snapshot.
+  if (!element._frameDeclared) return undefined;
+  const frameId = element._frameId;
+  let opaque = element._iframeOpaque === true ||
+      (element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin'));
+  const built = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
     opaque = sandboxOpaque;
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
@@ -17157,9 +17198,9 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     }
     child.innerWidth = 300;
     child.innerHeight = 150;
-  }, element._nid, srcdoc);
-  if (frameId) {
-    element._frameId = frameId;
+  }, element._nid, srcdoc, frameId);
+  if (built) {
+    element._iframeRealm = true;
     element._iframeOpaque = opaque;
     element._iframeWin = opaque ? _remoteWindow(frameId)
       : globalThis.__obscura_frameObjects[frameId].window;
@@ -17184,6 +17225,8 @@ function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
   _syncWindowIndices();
   element._frameId = 0;
+  element._frameDeclared = false;
+  element._iframeRealm = false;
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
   element._iframeRequest = null;
@@ -20329,7 +20372,12 @@ globalThis.__obscura_init_frames = function() {
     const src = frame.getAttribute('src');
     if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
     else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
-    else if (_ensureInitialFrameRealm(frame)) frame.dispatchEvent(new Event('load'));
+    else {
+      // Declare only: see the insertion sweep for why realm creation defers
+      // to first script access.
+      _declareInitialFrame(frame);
+      frame.dispatchEvent(new Event('load'));
+    }
   }
   _syncWindowIndices();
 
@@ -21039,24 +21087,24 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // accessors) plus the constructor itself native. This runs once at snapshot
 // build time, so it costs nothing per page, and genuinely-native V8 builtins
 // already report native, so only the JS-backed members are affected.
-(function _installChromeSurface() {
+function _installChromeSurface(G) {
   // Fingerprint scripts enumerate window constructors and read interface
   // identity (constructor.name, Symbol.toStringTag, prototype shape), so every
   // name desktop Chrome exposes on window needs the right name and prototype.
   // Most entries are inert stubs satisfying feature detection; a few carry
   // real behavior (Permissions, CacheStorage, CookieStore, CompressionStream).
   function _defClass(name, base) {
-    if (typeof globalThis[name] === 'function') return globalThis[name];
+    if (typeof G[name] === 'function') return G[name];
     var ctor = base ? class extends base {} : class {};
     try { Object.defineProperty(ctor, 'name', { value: name, configurable: true }); } catch (_e) {}
     _markNativeAs(ctor, 'function ' + name + '() { [native code] }');
     if (ctor.prototype) {
       try { Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (_e) {}
     }
-    globalThis[name] = ctor;
+    G[name] = ctor;
     return ctor;
   }
-  function _defNs(name, obj) { if (globalThis[name] === undefined) globalThis[name] = obj; }
+  function _defNs(name, obj) { if (G[name] === undefined) G[name] = obj; }
   function _inst(ctor) { return Object.create(ctor.prototype); }
   function _fn(name, fn) {
     try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_e) {}
@@ -21070,9 +21118,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 
   // --- Constructors ---
-  const _Event = globalThis.Event || Object;
-  const _Error = globalThis.Error;
-  const _Element = globalThis.HTMLElement || globalThis.Element || Object;
+  const _Event = G.Event || Object;
+  const _Error = G.Error;
+  const _Element = G.HTMLElement || G.Element || Object;
   'AnimationPlaybackEvent AudioProcessingEvent BeforeInstallPromptEvent BlobEvent CharacterBoundsUpdateEvent CloseEvent CommandEvent ContentVisibilityAutoStateChangeEvent CookieChangeEvent DeviceMotionEvent DeviceOrientationEvent DocumentPictureInPictureEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent GPUUncapturedErrorEvent HIDConnectionEvent HIDInputReportEvent InterestEvent MIDIConnectionEvent MIDIMessageEvent MediaEncryptedEvent MediaKeyMessageEvent MediaStreamEvent MediaStreamTrackEvent NavigateEvent NavigationCurrentEntryChangeEvent OfflineAudioCompletionEvent PageRevealEvent PageSwapEvent PageTransitionEvent PaymentMethodChangeEvent PaymentRequestUpdateEvent PictureInPictureEvent PresentationConnectionAvailableEvent PresentationConnectionCloseEvent RTCDataChannelEvent RTCDTMFToneChangeEvent RTCErrorEvent RTCPeerConnectionIceErrorEvent RTCPeerConnectionIceEvent RTCTrackEvent SecurityPolicyViolationEvent SensorErrorEvent SnapEvent SpeechRecognitionErrorEvent SpeechRecognitionEvent SpeechSynthesisErrorEvent SpeechSynthesisEvent TaskPriorityChangeEvent TextEvent TextFormatUpdateEvent TextUpdateEvent TouchEvent TrackEvent USBConnectionEvent VirtualKeyboardGeometryChangeEvent WebGLContextEvent WindowControlsOverlayGeometryChangeEvent XRInputSourceEvent XRInputSourcesChangeEvent XRReferenceSpaceEvent XRSessionEvent'
     .split(' ').forEach(function(n) { _defClass(n, _Event); });
   'DOMError IdentityCredentialError OverconstrainedError QuotaExceededError RTCError WebSocketError WebTransportError GPUError GPUInternalError GPUOutOfMemoryError GPUPipelineError GPUValidationError'
@@ -21108,15 +21156,15 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _defClass('PeriodicWave');
   _defClass('ScrollTimeline');
   _defClass('SharedStorageSetMethod');
-  _defClass('MathMLElement', globalThis.Element || Object);
-  _defClass('SVGMPathElement', globalThis.SVGElement || globalThis.Element || Object);
+  _defClass('MathMLElement', G.Element || Object);
+  _defClass('SVGMPathElement', G.SVGElement || G.Element || Object);
   var _ReportBody = _defClass('ReportBody');
   _defClass('CSPViolationReportBody', _ReportBody);
   _defClass('IntegrityViolationReportBody', _ReportBody);
   _defClass('XPathResult');
   _defClass('XRSpace', EventTargetOrObject());
   function EventTargetOrObject() {
-    return (globalThis.EventTarget && globalThis.EventTarget !== globalThis.Node) ? globalThis.EventTarget : Object;
+    return (G.EventTarget && G.EventTarget !== G.Node) ? G.EventTarget : Object;
   }
   // Constructor-name surface: presence + identity, inert behavior.
   'AbstractRange AnimationEffect AnimationTimeline AudioData AudioDecoder AudioEncoder AudioListener AudioParam AudioParamMap AudioSinkInfo AudioWorklet BackgroundFetchManager BackgroundFetchRecord BackgroundFetchRegistration BatteryManager BrowserCaptureMediaStreamTrack CanvasCaptureMediaStreamTrack CanvasGradient CanvasPattern CaptureController ChapterInformation Clipboard ClipboardItem CloseWatcher CreateMonitor CropTarget CSSAnimation CSSContainerRule CSSCounterStyleRule CSSFontFaceRule CSSFontFeatureValuesRule CSSFontPaletteValuesRule CSSFunctionDeclarations CSSFunctionDescriptors CSSFunctionRule CSSImageValue CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSKeywordValue CSSLayerBlockRule CSSLayerStatementRule CSSMarginRule CSSMathClamp CSSMathInvert CSSMathMax CSSMathMin CSSMathNegate CSSMathProduct CSSMathSum CSSMathValue CSSMatrixComponent CSSNamespaceRule CSSNestedDeclarations CSSNumericArray CSSNumericValue CSSPageRule CSSPerspective CSSPositionTryDescriptors CSSPositionTryRule CSSPositionValue CSSPropertyRule CSSRotate CSSScale CSSScopeRule CSSSkew CSSSkewX CSSSkewY CSSStartingStyleRule CSSStyleValue CSSTransformComponent CSSTransformValue CSSTransition CSSTranslate CSSUnitValue CSSUnparsedValue CSSVariableReferenceValue CSSViewTransitionRule CustomStateSet DOMMatrixReadOnly DOMPointReadOnly DOMQuad DOMRectReadOnly DataTransfer DataTransferItem DataTransferItemList DelegatedInkTrailPresenter DeviceMotionEventAcceleration DeviceMotionEventRotationRate DevicePosture DOMStringList EditContext EncodedAudioChunk EncodedVideoChunk EventCounts External EyeDropper FeaturePolicy FederatedCredential Fence FencedFrameConfig FetchLaterResult FileSystemDirectoryHandle FileSystemFileHandle FileSystemHandle FileSystemObserver FileSystemWritableFileStream FontData FragmentDirective GPU GPUAdapter GPUAdapterInfo GPUBindGroup GPUBindGroupLayout GPUBuffer GPUCanvasContext GPUCommandBuffer GPUCommandEncoder GPUCompilationInfo GPUCompilationMessage GPUComputePassEncoder GPUComputePipeline GPUDevice GPUDeviceLostInfo GPUError GPUExternalTexture GPUQuerySet GPUQueue GPURenderBundle GPURenderBundleEncoder GPURenderPassEncoder GPURenderPipeline GPUSampler GPUShaderModule GPUSupportedFeatures GPUSupportedLimits GPUTexture GPUTextureView Gamepad GamepadButton GamepadHapticActuator Geolocation GeolocationCoordinates GeolocationPosition GeolocationPositionError HID HIDDevice Highlight HighlightRegistry IDBRecord IdentityProvider IdleDeadline IdleDetector ImageBitmapRenderingContext ImageCapture ImageDecoder ImageTrack ImageTrackList Ink InputDeviceCapabilities InputDeviceInfo Keyboard KeyboardLayoutMap LanguageDetector LargestContentfulPaint LaunchParams LaunchQueue LayoutShift LayoutShiftAttribution Location Lock LockManager MIDIAccess MIDIInput MIDIInputMap MIDIOutput MIDIOutputMap MIDIPort MathMLElement MediaCapabilities MediaDeviceInfo MediaDevices MediaError MediaKeySession MediaKeyStatusMap MediaKeySystemAccess MediaKeys MediaList MediaMetadata MediaRecorder MediaSession MediaSource MediaSourceHandle MediaStreamTrackAudioStats MediaStreamTrackGenerator MediaStreamTrackProcessor MediaStreamTrackVideoStats Navigation NavigationActivation NavigationDestination NavigationHistoryEntry NavigationPrecommitController NavigationPreloadManager NavigationTransition NavigatorLogin NavigatorManagedData NavigatorUAData NodeIterator NotRestoredReasonDetails NotRestoredReasons Observable OffscreenCanvasRenderingContext2D PaymentAddress PaymentManager PaymentRequest PaymentResponse PerformanceElementTiming PerformanceEventTiming PerformanceLongAnimationFrameTiming PerformanceLongTaskTiming PerformanceNavigation PerformancePaintTiming PerformanceScriptTiming PerformanceServerTiming PerformanceTiming PeriodicSyncManager PictureInPictureWindow Presentation PresentationAvailability PresentationConnection PresentationConnectionList PresentationReceiver PresentationRequest PressureObserver PressureRecord Profiler ProtectedAudience PushManager PushSubscription PushSubscriptionOptions RadioNodeList ReadableByteStreamController ReadableStreamBYOBReader ReadableStreamBYOBRequest ReadableStreamDefaultController ReadableStreamDefaultReader RemotePlayback ReportingObserver RestrictionTarget RTCCertificate RTCDTMFSender RTCDataChannel RTCDtlsTransport RTCEncodedAudioFrame RTCEncodedVideoFrame RTCIceTransport RTCPeerConnectionIceErrorEvent RTCRtpReceiver RTCRtpScriptTransform RTCRtpSender RTCRtpTransceiver RTCSctpTransport RTCStatsReport SVGAngle SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGLength SVGLengthList SVGMatrix SVGNumber SVGNumberList SVGPoint SVGPointList SVGPreserveAspectRatio SVGRect SVGStringList SVGTransform SVGTransformList Scheduling ScreenDetailed ScreenDetails ScreenOrientation Serial SerialPort ServiceWorker ServiceWorkerRegistration SharedStorage SharedStorageAppendMethod SharedStorageClearMethod SharedStorageDeleteMethod SharedStorageModifierMethod SharedStorageWorklet SourceBuffer SourceBufferList SpeechGrammar SpeechGrammarList SpeechRecognition SpeechRecognitionPhrase SpeechSynthesis SpeechSynthesisVoice StorageBucket StorageBucketManager StorageManager StylePropertyMap StylePropertyMapReadOnly Subscriber Summarizer SyncManager TaskAttributionTiming TaskController TaskSignal TextFormat TextMetrics TimeRanges Touch TouchList TransformStreamDefaultController Translator TrustedHTML TrustedScript TrustedScriptURL TrustedTypePolicy TrustedTypePolicyFactory USB USBAlternateInterface USBConfiguration USBDevice USBEndpoint USBInTransferResult USBInterface USBIsochronousInTransferPacket USBIsochronousInTransferResult USBIsochronousOutTransferPacket USBIsochronousOutTransferResult USBOutTransferResult UserActivation VideoColorSpace VideoDecoder VideoEncoder VideoFrame VideoPlaybackQuality ViewTimeline ViewTransition ViewTransitionTypeSet Viewport VirtualKeyboard VisibilityStateEntry VisualViewport WGSLLanguageFeatures WakeLock WakeLockSentinel WebKitCSSMatrix WebKitMutationObserver WebSocketStream WebTransport WebTransportBidirectionalStream WebTransportDatagramDuplexStream WindowControlsOverlay Worklet WritableStreamDefaultController WritableStreamDefaultWriter XMLHttpRequestUpload XPathEvaluator XPathExpression XRAnchor XRAnchorSet XRBoundedReferenceSpace XRCPUDepthInformation XRCamera XRDOMOverlayState XRDepthInformation XRFrame XRHand XRHitTestResult XRHitTestSource XRInputSource XRInputSourceArray XRJointPose XRJointSpace XRLayer XRLightEstimate XRLightProbe XRPose XRRay XRReferenceSpace XRRenderState XRRigidTransform XRSession XRTransientInputHitTestResult XRTransientInputHitTestSource XRView XRViewerPose XRViewport XRWebGLBinding XRWebGLDepthInformation XRWebGLLayer XSLTProcessor'
@@ -21133,7 +21181,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   // --- Interface identity for objects bootstrap already creates ---
   var _Location = _defClass('Location');
   try { Object.setPrototypeOf(_locationObj, _Location.prototype); } catch (_e) {}
-  var _DOMStringList = globalThis.DOMStringList;
+  var _DOMStringList = G.DOMStringList;
   Object.defineProperty(_DOMStringList.prototype, 'length', { get: function() { return this._v ? this._v.length : 0; }, enumerable: true, configurable: true });
   _DOMStringList.prototype.item = function(i) { return this._v && i < this._v.length ? this._v[i] : null; };
   _DOMStringList.prototype.contains = function(s) { return !!(this._v && this._v.indexOf(s) >= 0); };
@@ -21145,16 +21193,16 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }),
     enumerable: true, configurable: true,
   });
-  _defClass('HTMLDocument', globalThis.Document || Object);
-  if (navigator.userAgentData && globalThis.NavigatorUAData) {
-    try { Object.setPrototypeOf(navigator.userAgentData, globalThis.NavigatorUAData.prototype); } catch (_e) {}
+  _defClass('HTMLDocument', G.Document || Object);
+  if (navigator.userAgentData && G.NavigatorUAData) {
+    try { Object.setPrototypeOf(navigator.userAgentData, G.NavigatorUAData.prototype); } catch (_e) {}
   }
-  if (globalThis.navigation && globalThis.Navigation) {
-    try { Object.setPrototypeOf(globalThis.navigation, globalThis.Navigation.prototype); } catch (_e) {}
+  if (G.navigation && G.Navigation) {
+    try { Object.setPrototypeOf(G.navigation, G.Navigation.prototype); } catch (_e) {}
   }
   try { Object.defineProperty(Screen.prototype, Symbol.toStringTag, { value: 'Screen', configurable: true }); } catch (_e) {}
   try { Object.defineProperty(NetworkInformation.prototype, Symbol.toStringTag, { value: 'NetworkInformation', configurable: true }); } catch (_e) {}
-  try { Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'Window', configurable: true }); } catch (_e) {}
+  try { Object.defineProperty(G, Symbol.toStringTag, { value: 'Window', configurable: true }); } catch (_e) {}
   // navigator.* member objects get their interface prototypes too.
   var _navMemberProtos = {
     credentials: 'CredentialsContainer', locks: 'LockManager', mediaSession: 'MediaSession',
@@ -21170,14 +21218,14 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   };
   if (!navigator.trustedTypes) {
     try {
-      navigator.trustedTypes = _inst(globalThis.TrustedTypePolicyFactory);
+      navigator.trustedTypes = _inst(G.TrustedTypePolicyFactory);
       navigator.trustedTypes.defaultPolicy = null;
       navigator.trustedTypes.emptyHTML = '';
       navigator.trustedTypes.emptyScript = '';
     } catch (_e) {}
   }
   for (const _pk in _navMemberProtos) {
-    var _pc = globalThis[_navMemberProtos[_pk]];
+    var _pc = G[_navMemberProtos[_pk]];
     if (_pc && navigator[_pk] && typeof navigator[_pk] === 'object') {
       try { Object.setPrototypeOf(navigator[_pk], _pc.prototype); } catch (_e) {}
     }
@@ -21187,99 +21235,99 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   var _BarProp = _defClass('BarProp');
   _getter(_BarProp.prototype, 'visible', true);
   'locationbar menubar personalbar scrollbars statusbar toolbar'.split(' ').forEach(function(n) {
-    if (globalThis[n] === undefined) globalThis[n] = _inst(_BarProp);
+    if (G[n] === undefined) G[n] = _inst(_BarProp);
   });
-  var _External = globalThis.External;
+  var _External = G.External;
   _External.prototype.AddSearchProvider = function() {};
   _External.prototype.IsSearchProviderInstalled = function() { return 0; };
-  if (globalThis.external === undefined) globalThis.external = _inst(_External);
-  Object.defineProperty(globalThis, 'isSecureContext', {
+  if (G.external === undefined) G.external = _inst(_External);
+  Object.defineProperty(G, 'isSecureContext', {
     get: _fn('get isSecureContext', function() {
       try {
-        var p = String(globalThis.location.protocol);
+        var p = String(G.location.protocol);
         if (p === 'https:' || p === 'wss:' || p === 'file:') return true;
-        var h = String(globalThis.location.hostname);
+        var h = String(G.location.hostname);
         return h === 'localhost' || h === '::1' || h === '[::1]' || /^127\./.test(h);
       } catch (_e) { return false; }
     }),
     enumerable: true, configurable: true,
   });
-  if (globalThis.originAgentCluster === undefined) globalThis.originAgentCluster = true;
-  if (globalThis.crossOriginIsolated === undefined) globalThis.crossOriginIsolated = false;
-  if (globalThis.credentialless === undefined) globalThis.credentialless = false;
-  if (globalThis.offscreenBuffering === undefined) globalThis.offscreenBuffering = true;
-  if (globalThis.status === undefined) globalThis.status = '';
-  if (globalThis.clientInformation === undefined) {
-    Object.defineProperty(globalThis, 'clientInformation', {
+  if (G.originAgentCluster === undefined) G.originAgentCluster = true;
+  if (G.crossOriginIsolated === undefined) G.crossOriginIsolated = false;
+  if (G.credentialless === undefined) G.credentialless = false;
+  if (G.offscreenBuffering === undefined) G.offscreenBuffering = true;
+  if (G.status === undefined) G.status = '';
+  if (G.clientInformation === undefined) {
+    Object.defineProperty(G, 'clientInformation', {
       get: _fn('get clientInformation', function() { return navigator; }),
       enumerable: true, configurable: true,
     });
   }
-  globalThis.find = _fn('find', function() { return false; });
-  globalThis.moveTo = _fn('moveTo', function() {});
-  globalThis.moveBy = _fn('moveBy', function() {});
-  globalThis.resizeTo = _fn('resizeTo', function() {});
-  globalThis.resizeBy = _fn('resizeBy', function() {});
-  globalThis.captureEvents = _fn('captureEvents', function() {});
-  globalThis.releaseEvents = _fn('releaseEvents', function() {});
-  globalThis.fetchLater = _fn('fetchLater', function() { return { activated: false }; });
-  globalThis.showOpenFilePicker = _fn('showOpenFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
-  globalThis.showSaveFilePicker = _fn('showSaveFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
-  globalThis.showDirectoryPicker = _fn('showDirectoryPicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
-  globalThis.queryLocalFonts = _fn('queryLocalFonts', function() { return Promise.resolve([]); });
-  globalThis.getScreenDetails = _fn('getScreenDetails', function() {
-    var d = _inst(globalThis.ScreenDetails);
-    var s = _inst(globalThis.ScreenDetailed);
-    var scr = globalThis.screen;
+  G.find = _fn('find', function() { return false; });
+  G.moveTo = _fn('moveTo', function() {});
+  G.moveBy = _fn('moveBy', function() {});
+  G.resizeTo = _fn('resizeTo', function() {});
+  G.resizeBy = _fn('resizeBy', function() {});
+  G.captureEvents = _fn('captureEvents', function() {});
+  G.releaseEvents = _fn('releaseEvents', function() {});
+  G.fetchLater = _fn('fetchLater', function() { return { activated: false }; });
+  G.showOpenFilePicker = _fn('showOpenFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.showSaveFilePicker = _fn('showSaveFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.showDirectoryPicker = _fn('showDirectoryPicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.queryLocalFonts = _fn('queryLocalFonts', function() { return Promise.resolve([]); });
+  G.getScreenDetails = _fn('getScreenDetails', function() {
+    var d = _inst(G.ScreenDetails);
+    var s = _inst(G.ScreenDetailed);
+    var scr = G.screen;
     if (scr) for (const k of ['availWidth', 'availHeight', 'width', 'height', 'colorDepth', 'pixelDepth']) {
       try { s[k] = scr[k]; } catch (_e) {}
     }
     s.availTop = 0; s.availLeft = 0; s.left = 0; s.top = 0;
     s.isPrimary = true; s.isInternal = true;
-    s.devicePixelRatio = globalThis.devicePixelRatio || 1;
+    s.devicePixelRatio = G.devicePixelRatio || 1;
     d.screens = [s]; d.currentScreen = s;
     return Promise.resolve(d);
   });
-  if (globalThis.viewport === undefined && globalThis.Viewport) globalThis.viewport = _inst(globalThis.Viewport);
-  globalThis.styleMedia = {
+  if (G.viewport === undefined && G.Viewport) G.viewport = _inst(G.Viewport);
+  G.styleMedia = {
     type: 'screen',
     matchMedium: _fn('matchMedium', function(q) { try { return matchMedia(q).matches; } catch (_e) { return false; } }),
   };
-  var _LaunchQueue = globalThis.LaunchQueue;
+  var _LaunchQueue = G.LaunchQueue;
   _LaunchQueue.prototype.setConsumer = function() {};
-  if (globalThis.launchQueue === undefined) globalThis.launchQueue = _inst(_LaunchQueue);
+  if (G.launchQueue === undefined) G.launchQueue = _inst(_LaunchQueue);
   var _DPIP = _defClass('DocumentPictureInPicture');
   _getter(_DPIP.prototype, 'window', null);
   _DPIP.prototype.requestWindow = function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
   _DPIP.prototype.addEventListener = function() {};
   _DPIP.prototype.removeEventListener = function() {};
-  if (globalThis.documentPictureInPicture === undefined) globalThis.documentPictureInPicture = _inst(_DPIP);
-  var _Fence = globalThis.Fence;
+  if (G.documentPictureInPicture === undefined) G.documentPictureInPicture = _inst(_DPIP);
+  var _Fence = G.Fence;
   _Fence.prototype.reportEvent = function() {};
   _Fence.prototype.setReportEventDataForAutomaticBeacons = function() {};
-  if (globalThis.fence === undefined) globalThis.fence = _inst(_Fence);
-  var _SharedStorage = globalThis.SharedStorage;
+  if (G.fence === undefined) G.fence = _inst(_Fence);
+  var _SharedStorage = G.SharedStorage;
   'set append delete clear'.split(' ').forEach(function(m) { _SharedStorage.prototype[m] = function() { return Promise.resolve(); }; });
   _SharedStorage.prototype.run = function() { return Promise.resolve(null); };
   _SharedStorage.prototype.selectURL = function() { return Promise.resolve(null); };
-  if (globalThis.sharedStorage === undefined) {
+  if (G.sharedStorage === undefined) {
     var _ss = _inst(_SharedStorage);
     _ss.worklet = null;
-    globalThis.sharedStorage = _ss;
+    G.sharedStorage = _ss;
   }
   // webkit-prefixed aliases desktop Chrome still ships.
-  if (globalThis.URL && globalThis.webkitURL === undefined) globalThis.webkitURL = globalThis.URL;
-  if (globalThis.MediaStream && globalThis.webkitMediaStream === undefined) globalThis.webkitMediaStream = globalThis.MediaStream;
-  if (globalThis.RTCPeerConnection && globalThis.webkitRTCPeerConnection === undefined) globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
-  if (globalThis.webkitRequestAnimationFrame === undefined) globalThis.webkitRequestAnimationFrame = globalThis.requestAnimationFrame;
-  if (globalThis.webkitCancelAnimationFrame === undefined) globalThis.webkitCancelAnimationFrame = globalThis.cancelAnimationFrame;
-  globalThis.webkitRequestFileSystem = _fn('webkitRequestFileSystem', function() {});
-  globalThis.webkitResolveLocalFileSystemURL = _fn('webkitResolveLocalFileSystemURL', function() {});
-  _defClass('webkitSpeechRecognition', globalThis.SpeechRecognition || undefined);
+  if (G.URL && G.webkitURL === undefined) G.webkitURL = G.URL;
+  if (G.MediaStream && G.webkitMediaStream === undefined) G.webkitMediaStream = G.MediaStream;
+  if (G.RTCPeerConnection && G.webkitRTCPeerConnection === undefined) G.webkitRTCPeerConnection = G.RTCPeerConnection;
+  if (G.webkitRequestAnimationFrame === undefined) G.webkitRequestAnimationFrame = G.requestAnimationFrame;
+  if (G.webkitCancelAnimationFrame === undefined) G.webkitCancelAnimationFrame = G.cancelAnimationFrame;
+  G.webkitRequestFileSystem = _fn('webkitRequestFileSystem', function() {});
+  G.webkitResolveLocalFileSystemURL = _fn('webkitResolveLocalFileSystemURL', function() {});
+  _defClass('webkitSpeechRecognition', G.SpeechRecognition || undefined);
   _defClass('webkitSpeechRecognitionError', _Event);
   _defClass('webkitSpeechRecognitionEvent', _Event);
-  if (globalThis.webkitSpeechGrammarList === undefined) globalThis.webkitSpeechGrammarList = globalThis.SpeechGrammarList;
-  if (globalThis.webkitSpeechGrammar === undefined) globalThis.webkitSpeechGrammar = globalThis.SpeechGrammar;
+  if (G.webkitSpeechGrammarList === undefined) G.webkitSpeechGrammarList = G.SpeechGrammarList;
+  if (G.webkitSpeechGrammar === undefined) G.webkitSpeechGrammar = G.SpeechGrammar;
 
   // --- Permissions ---
   var _PermissionStatus = _defClass('PermissionStatus');
@@ -21290,7 +21338,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _PermissionStatus.prototype.addEventListener = function() {};
   _PermissionStatus.prototype.removeEventListener = function() {};
   var _PERMISSION_STATES = {
-    'notifications': function() { return globalThis.Notification && Notification.permission === 'granted' ? 'granted' : 'prompt'; },
+    'notifications': function() { return G.Notification && Notification.permission === 'granted' ? 'granted' : 'prompt'; },
     'geolocation': 'prompt', 'camera': 'prompt', 'microphone': 'prompt', 'midi': 'prompt',
     'clipboard-read': 'prompt', 'clipboard-write': 'granted', 'persistent-storage': 'granted',
     'background-sync': 'granted', 'accelerometer': 'granted', 'gyroscope': 'granted',
@@ -21390,14 +21438,14 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
     return Promise.resolve(undefined);
   };
-  if (globalThis.caches === undefined) globalThis.caches = _inst(_CacheStorage);
+  if (G.caches === undefined) G.caches = _inst(_CacheStorage);
 
   // --- CookieStore backed by document.cookie ---
   var _CookieStore = _defClass('CookieStore');
   _defClass('CookieStoreManager');
   function _cookieEntries() {
     var out = []; var raw = '';
-    try { raw = (globalThis.document && globalThis.document.cookie) || ''; } catch (_e) {}
+    try { raw = (G.document && G.document.cookie) || ''; } catch (_e) {}
     for (const part of raw.split(';')) {
       var idx = part.indexOf('=');
       if (idx < 0) continue;
@@ -21422,25 +21470,25 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     var s = String(opts.name) + '=' + (opts.value === undefined ? '' : String(opts.value)) + '; path=' + (opts.path || '/');
     if (opts.expires) s += '; expires=' + new Date(opts.expires).toUTCString();
     if (opts.sameSite) s += '; SameSite=' + opts.sameSite;
-    globalThis.document.cookie = s;
+    G.document.cookie = s;
     return Promise.resolve();
   };
   _CookieStore.prototype.delete = function(name) {
     if (name && typeof name === 'object') name = name.name;
-    globalThis.document.cookie = String(name) + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+    G.document.cookie = String(name) + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
     return Promise.resolve();
   };
   _CookieStore.prototype.addEventListener = function() {};
   _CookieStore.prototype.removeEventListener = function() {};
   _CookieStore.prototype.onchange = null;
-  if (globalThis.cookieStore === undefined) globalThis.cookieStore = _inst(_CookieStore);
+  if (G.cookieStore === undefined) G.cookieStore = _inst(_CookieStore);
 
   // --- Trusted Types ---
-  var _TrustedHTML = globalThis.TrustedHTML;
-  var _TrustedScript = globalThis.TrustedScript;
-  var _TrustedScriptURL = globalThis.TrustedScriptURL;
-  var _TTP = globalThis.TrustedTypePolicy;
-  var _TTPF = globalThis.TrustedTypePolicyFactory;
+  var _TrustedHTML = G.TrustedHTML;
+  var _TrustedScript = G.TrustedScript;
+  var _TrustedScriptURL = G.TrustedScriptURL;
+  var _TTP = G.TrustedTypePolicy;
+  var _TTPF = G.TrustedTypePolicyFactory;
   function _mkTrusted(cls, s) {
     var o = _inst(cls);
     o._v = String(s);
@@ -21460,12 +21508,12 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   _TTPF.prototype.isScript = function(v) { return v instanceof _TrustedScript; };
   _TTPF.prototype.isScriptURL = function(v) { return v instanceof _TrustedScriptURL; };
   _getter(_TTPF.prototype, 'defaultPolicy', null);
-  if (globalThis.trustedTypes === undefined) {
+  if (G.trustedTypes === undefined) {
     var _ttp = _inst(_TTPF);
     _ttp.emptyHTML = _mkTrusted(_TrustedHTML, '');
     _ttp.emptyScript = _mkTrusted(_TrustedScript, '');
     _ttp.emptyScriptURL = _mkTrusted(_TrustedScriptURL, '');
-    globalThis.trustedTypes = _ttp;
+    G.trustedTypes = _ttp;
   }
 
   // --- CompressionStream / DecompressionStream via the Rust codec op ---
@@ -21480,7 +21528,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     return u8;
   }
   function _compressionClass(direction) {
-    var base = globalThis.TransformStream || Object;
+    var base = G.TransformStream || Object;
     return class extends base {
       constructor(format) {
         if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
@@ -21504,8 +21552,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       }
     };
   }
-  if (typeof globalThis.CompressionStream !== 'function') globalThis.CompressionStream = _compressionClass('compress');
-  if (typeof globalThis.DecompressionStream !== 'function') globalThis.DecompressionStream = _compressionClass('decompress');
+  if (typeof G.CompressionStream !== 'function') G.CompressionStream = _compressionClass('compress');
+  if (typeof G.DecompressionStream !== 'function') G.DecompressionStream = _compressionClass('decompress');
   try { Object.defineProperty(CompressionStream, 'name', { value: 'CompressionStream', configurable: true }); } catch (_e) {}
   try { Object.defineProperty(DecompressionStream, 'name', { value: 'DecompressionStream', configurable: true }); } catch (_e) {}
   var _BLQS = _defClass('ByteLengthQueuingStrategy');
@@ -21562,7 +21610,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
     return c;
   }
-  if (globalThis.Document) {
+  if (G.Document) {
     Object.defineProperty(Document.prototype, 'all', {
       get: _fn('get all', function() { return _documentAllFor(this); }),
       enumerable: true, configurable: true,
@@ -21570,7 +21618,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 
   // --- Document fullscreen/PiP/pointer-lock flags ---
-  if (globalThis.Document) {
+  if (G.Document) {
     _getter(Document.prototype, 'fullscreenEnabled', true);
     _getter(Document.prototype, 'webkitFullscreenEnabled', true);
     _getter(Document.prototype, 'fullscreenElement', null);
@@ -21585,7 +21633,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     Document.prototype.webkitExitFullscreen = function() { return Promise.resolve(); };
     Document.prototype.exitPointerLock = function() {};
     Document.prototype.exitPictureInPicture = function() { return Promise.resolve(); };
-    if (globalThis.Element) {
+    if (G.Element) {
       Element.prototype.requestFullscreen = function() { return Promise.reject(new DOMException('Fullscreen is not supported', 'NotSupportedError')); };
       Element.prototype.webkitRequestFullscreen = Element.prototype.requestFullscreen;
     }
@@ -21600,7 +21648,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     _getter(Document.prototype, 'xmlVersion', null);
     Object.defineProperty(Document.prototype, 'featurePolicy', {
       get: _fn('get featurePolicy', function() {
-        var fp = _inst(globalThis.FeaturePolicy);
+        var fp = _inst(G.FeaturePolicy);
         fp.allowedFeatures = _fn('allowedFeatures', function() {
           return 'geolocation ch-ua-full-version-list cross-origin-isolated screen-wake-lock on-device-speech-recognition'.split(' ');
         });
@@ -21613,15 +21661,15 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     Document.prototype.hasStorageAccess = function hasStorageAccess() { return Promise.resolve(false); };
     Document.prototype.requestStorageAccess = function requestStorageAccess() { return Promise.resolve(); };
     Document.prototype.startViewTransition = function startViewTransition() {
-      var t = _inst(globalThis.ViewTransition);
+      var t = _inst(G.ViewTransition);
       t.ready = Promise.resolve(); t.finished = Promise.resolve();
       t.updateCallbackDone = Promise.resolve();
       t.skipTransition = function() {};
       return t;
     };
     Document.prototype.createExpression = function createExpression(expr, resolver) {
-      var e = _inst(globalThis.XPathExpression);
-      e.evaluate = function() { return _inst(globalThis.XPathResult || Object); };
+      var e = _inst(G.XPathExpression);
+      e.evaluate = function() { return _inst(G.XPathResult || Object); };
       return e;
     };
     Object.defineProperty(Document.prototype, 'lastModified', {
@@ -21649,13 +21697,13 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 
   // CSS namespace extras Chrome exposes.
-  if (globalThis.CSS) {
-    try { CSS.highlights = globalThis.HighlightRegistry ? _inst(globalThis.HighlightRegistry) : new Map(); } catch (_e) {}
+  if (G.CSS) {
+    try { CSS.highlights = G.HighlightRegistry ? _inst(G.HighlightRegistry) : new Map(); } catch (_e) {}
     CSS.paintWorklet = { addModule: function() { return Promise.reject(new DOMException('Worklets are not supported', 'NotSupportedError')); } };
     CSS.registerProperty = function() {};
     CSS.supports = CSS.supports || function() { return false; };
   }
-  if (globalThis.StorageManager) {
+  if (G.StorageManager) {
     StorageManager.prototype.estimate = StorageManager.prototype.estimate || function() { return Promise.resolve({ quota: 0, usage: 0 }); };
     StorageManager.prototype.persist = StorageManager.prototype.persist || function() { return Promise.resolve(false); };
     StorageManager.prototype.persisted = StorageManager.prototype.persisted || function() { return Promise.resolve(false); };
@@ -21902,7 +21950,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       Math.max(1, (canvas.width | 0) || 300), Math.max(1, (canvas.height | 0) || 150),
       v2 ? 1 : 0) : -1;
     if (gid < 0) return _installWebGLContextShim(canvas, v2);
-    var proto = v2 ? globalThis.WebGL2RenderingContext.prototype : globalThis.WebGLRenderingContext.prototype;
+    var proto = v2 ? G.WebGL2RenderingContext.prototype : G.WebGLRenderingContext.prototype;
     var ctx = Object.create(proto);
     ctx._canvas = canvas;
     ctx.canvas = canvas;
@@ -21918,7 +21966,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     };
     var _o = {};
     var _mk = function(tag, cls, h) {
-      var o = _inst(globalThis[cls]);
+      var o = _inst(G[cls]);
       o._h = h;
       _o[tag + h] = o;
       return o;
@@ -22037,7 +22085,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     });
     ctx.getShaderPrecisionFormat = _fn('getShaderPrecisionFormat', function(st, pt) {
       var r = _g('getShaderPrecisionFormat', [st, pt]);
-      var info = _inst(globalThis.WebGLShaderPrecisionFormat);
+      var info = _inst(G.WebGLShaderPrecisionFormat);
       if (r) { info.rangeMin = r.mn; info.rangeMax = r.mx; info.precision = r.p; }
       return info;
     });
@@ -22051,14 +22099,14 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     ctx.getActiveAttrib = _fn('getActiveAttrib', function(p, i) {
       var r = _g('getActiveAttrib', [_hid(p), i]);
       if (!r) return null;
-      var info = _inst(globalThis.WebGLActiveInfo);
+      var info = _inst(G.WebGLActiveInfo);
       info.name = r.n; info.size = r.s; info.type = r.t;
       return info;
     });
     ctx.getActiveUniform = _fn('getActiveUniform', function(p, i) {
       var r = _g('getActiveUniform', [_hid(p), i]);
       if (!r) return null;
-      var info = _inst(globalThis.WebGLActiveInfo);
+      var info = _inst(G.WebGLActiveInfo);
       info.name = r.n; info.size = r.s; info.type = r.t;
       return info;
     });
@@ -22168,14 +22216,14 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     for (const m of _glFalseMethods) if (!ctx[m]) ctx[m] = _fn(m, function() { return false; });
     for (const m in _glObjectCtors) {
       if (!ctx[m]) ctx[m] = _fn(m, (function(cls) {
-        return function() { return _inst(globalThis[cls]); };
+        return function() { return _inst(G[cls]); };
       })(_glObjectCtors[m]));
     }
     return ctx;
   }
   function _installWebGLContextShim(canvas, v2) {
 
-    var proto = v2 ? globalThis.WebGL2RenderingContext.prototype : globalThis.WebGLRenderingContext.prototype;
+    var proto = v2 ? G.WebGL2RenderingContext.prototype : G.WebGLRenderingContext.prototype;
     var ctx = Object.create(proto);
     var params = v2 ? _gl2Params : _gl1Params;
     var exts = v2 ? _gl2Exts : _gl1Exts;
@@ -22209,16 +22257,16 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     ctx.getShaderSource = _fn('getShaderSource', function() { return ''; });
     ctx.getAttachedShaders = _fn('getAttachedShaders', function() { return []; });
     ctx.getActiveAttrib = _fn('getActiveAttrib', function() {
-      var info = _inst(globalThis.WebGLActiveInfo);
+      var info = _inst(G.WebGLActiveInfo);
       info.name = ''; info.size = 0; info.type = 0;
       return info;
     });
     ctx.getActiveUniform = _fn('getActiveUniform', function() {
-      var info = _inst(globalThis.WebGLActiveInfo);
+      var info = _inst(G.WebGLActiveInfo);
       info.name = ''; info.size = 0; info.type = 0;
       return info;
     });
-    ctx.getUniformLocation = _fn('getUniformLocation', function() { return _inst(globalThis.WebGLUniformLocation); });
+    ctx.getUniformLocation = _fn('getUniformLocation', function() { return _inst(G.WebGLUniformLocation); });
     ctx.getVertexAttribOffset = _fn('getVertexAttribOffset', function() { return 0; });
     ctx.getFragDataLocation = _fn('getFragDataLocation', function() { return -1; });
     ctx.getUniformBlockIndex = _fn('getUniformBlockIndex', function() { return 0; });
@@ -22230,17 +22278,19 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     for (const m of _glFalseMethods) ctx[m] = _fn(m, function() { return false; });
     for (const m in _glObjectCtors) {
       ctx[m] = _fn(m, (function(cls) {
-        return function() { return _inst(globalThis[cls]); };
+        return function() { return _inst(G[cls]); };
       })(_glObjectCtors[m]));
     }
     return ctx;
   }
   _createWebGLContext = _installWebGLContext;
   var _BAC = _defClass('BaseAudioContext');
-  if (globalThis.AudioContext) try { Object.setPrototypeOf(globalThis.AudioContext.prototype, _BAC.prototype); } catch (_e) {}
-  if (globalThis.OfflineAudioContext) try { Object.setPrototypeOf(globalThis.OfflineAudioContext.prototype, _BAC.prototype); } catch (_e) {}
+  if (G.AudioContext) try { Object.setPrototypeOf(G.AudioContext.prototype, _BAC.prototype); } catch (_e) {}
+  if (G.OfflineAudioContext) try { Object.setPrototypeOf(G.OfflineAudioContext.prototype, _BAC.prototype); } catch (_e) {}
   Navigator.prototype.clearOriginJoinedAdInterestGroups = _fn('clearOriginJoinedAdInterestGroups', function() { return Promise.resolve(); });
-})();
+}
+
+_installChromeSurface(globalThis);
 
 var _createWebGLContext;
 var _pageSeedNavigationEntry;

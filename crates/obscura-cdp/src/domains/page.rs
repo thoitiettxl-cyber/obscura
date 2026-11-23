@@ -1680,7 +1680,7 @@ pub async fn handle(
                         tracing::warn!("Immediate preload: {error}");
                     }
                     if let Some(js) = &mut page.js {
-                        for frame in &page.frames {
+                        for frame in &mut page.frames {
                             if let Err(error) = frame.execute_script(js, source) {
                                 tracing::warn!("Immediate frame preload: {error}");
                             }

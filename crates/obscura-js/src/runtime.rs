@@ -5631,7 +5631,7 @@ mod tests {
     #[test]
     fn select_legacy_methods_work_in_child_realms() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://example.com/child", "<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option></optgroup></select></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, r#"(() => {
             const select = document.querySelector('select');
@@ -5647,7 +5647,7 @@ mod tests {
     fn cdp_frame_console_retention_bounds_page_owned_store_getters() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.set_runtime_events_enabled(true);
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
         frame.execute_script(&mut rt, r#"console.log({answer:42});
             globalThis.__obscura_objects = new Proxy({}, {get() { while (true) {} }});
@@ -5664,7 +5664,7 @@ mod tests {
     fn cdp_frame_console_objects_keep_their_world_without_leaking_child_store_entries() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.set_runtime_events_enabled(true);
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
         frame.execute_script(&mut rt, "console.log({answer:42})").unwrap();
         let events = rt.take_pending_runtime_events();
@@ -5687,7 +5687,7 @@ mod tests {
     #[test]
     fn cdp_frame_handles_keep_the_wrapping_world_and_reject_reused_realms() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://example.com/child", "<html><body>child</body></html>").unwrap();
         frame.evaluate(&mut rt, "globalThis.childObject = {nested: {answer:42}}").unwrap();
         let child = rt.start_cdp_evaluation_in_frame(Some(1), "childObject", false, false).unwrap();
@@ -5868,7 +5868,7 @@ mod tests {
     #[test]
     fn table_rows_are_live_in_child_realms() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, r#"(() => {
             const table = document.querySelector('table');
@@ -6050,7 +6050,7 @@ mod tests {
     #[test]
     fn noninteractive_dialog_defaults_apply_to_child_realms() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://example.com/child", "<html><body></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, "confirm('Delete?')").unwrap(),
             serde_json::json!(false));
@@ -26242,7 +26242,7 @@ mod tests {
     fn frame_event_trust_does_not_call_parent_weak_set_overrides() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.evaluate("(() => { globalThis.trustLeaks = 0; WeakSet.prototype.add = function() { trustLeaks++; throw new Error('parent override'); }; })()").unwrap();
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "https://other.example/frame", "<html><body><input id='field'></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, r#"(() => {
             const field = document.getElementById('field');
@@ -26621,7 +26621,7 @@ mod tests {
         // The embedder owns frame creation and fires the element's load after it.
         rt.run_event_loop_bounded(100).await.unwrap();
         let frame = rt.take_pending_frames().remove(0);
-        let realm = crate::frame::FrameRealm::new(
+        let mut realm = crate::frame::FrameRealm::new(
             &mut rt, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html,
         ).unwrap();
         realm.dispatch_load_events(&mut rt).unwrap();
@@ -27287,7 +27287,7 @@ mod tests {
     #[test]
     fn web_storage_constructor_replacement_keeps_child_origin_buckets() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+        let mut frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
             "http://example.com/child", "<html><body>child</body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut rt, r#"(() => {
             globalThis.Storage = null;
@@ -27300,7 +27300,7 @@ mod tests {
             globalThis.Storage = {};
             return [localStorage.shared, sessionStorage.shared];
         })()"#).unwrap(), serde_json::json!(["child", "same-tab"]));
-        let foreign = crate::frame::FrameRealm::new(&mut rt, 2, 0,
+        let mut foreign = crate::frame::FrameRealm::new(&mut rt, 2, 0,
             "http://foreign.test/child", "<html><body>foreign</body></html>").unwrap();
         assert_eq!(foreign.evaluate(&mut rt, r#"(() => {
             globalThis.Storage = undefined;
@@ -29315,7 +29315,7 @@ mod tests {
         rt.execute_script("http://example.com/parser.js", "let frameValue = 'parent';").unwrap();
         for (id, url, value) in [(1, "http://example.com/child", "same"),
             (2, "http://foreign.test/child", "foreign")] {
-            let frame = crate::frame::FrameRealm::new(&mut rt, id, 0, url,
+            let mut frame = crate::frame::FrameRealm::new(&mut rt, id, 0, url,
                 "<html><head></head><body></body></html>").unwrap();
             frame.execute_script(&mut rt, &format!(r#"(() => {{
                 const first = document.createElement('script');
