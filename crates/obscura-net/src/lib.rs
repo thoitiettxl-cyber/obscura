@@ -3,6 +3,7 @@ mod document_progress;
 pub use document_progress::{DocumentInterruption, DocumentProgress, DocumentRequest, DocumentResponse, InterruptedDocument};
 pub mod cookies;
 pub mod cookie_import;
+pub mod geoip;
 pub mod encoding;
 pub mod websocket;
 pub mod interceptor;

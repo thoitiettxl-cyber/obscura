@@ -71,6 +71,16 @@ struct Args {
     #[arg(long, global = true, requires = "chrome_profile")]
     chrome_key: Option<String>,
 
+    /// Skip the egress-IP identity sync that otherwise runs whenever --proxy
+    /// (or OBSCURA_PROXY) is configured: one geo lookup through the proxy pins
+    /// timezone, geolocation, navigator.language, and Accept-Language to the
+    /// exit region (same idea as camofox's geoip launch option). Explicit
+    /// OBSCURA_TIMEZONE / OBSCURA_GEOLOCATION / OBSCURA_LOCALE /
+    /// OBSCURA_ACCEPT_LANGUAGE always win; a failed lookup just keeps defaults.
+    /// Equivalent to OBSCURA_GEOIP=0.
+    #[arg(long, global = true)]
+    no_geoip: bool,
+
     /// Permit fetches to loopback, RFC1918, and link-local addresses.
     /// Default is to block them (SSRF fix from #4). Use this for local
     /// development against http://localhost:N or http://192.168.x.y.
@@ -350,6 +360,72 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+/// The proxy this run will actually use: a subcommand-level --proxy where one
+/// exists, then the global flag, then OBSCURA_PROXY (same precedence as the
+/// serve branch).
+fn effective_proxy(args: &Args) -> Option<String> {
+    let command_proxy = match &args.command {
+        Some(Command::Serve { proxy, .. }) | Some(Command::Mcp { proxy, .. }) => proxy.clone(),
+        _ => None,
+    };
+    merge_proxy(args.proxy.clone(), command_proxy).or_else(|| {
+        std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty())
+    })
+}
+
+/// Sync the browser's identity surfaces with the proxy's egress IP (port of
+/// camofox's geoip technique). One lookup through the proxy yields the exit
+/// region's IANA timezone, coordinates, and locale; each fills only surfaces
+/// the operator has not pinned explicitly. Runs before the TZ pin and before
+/// any isolate starts, so every surface (Date, Intl, navigator.geolocation,
+/// navigator.language, Accept-Language) reports a consistent identity.
+/// Fail-open: lookup errors keep the defaults.
+async fn sync_geoip_identity(args: &Args) {
+    if args.no_geoip {
+        return;
+    }
+    if matches!(std::env::var("OBSCURA_GEOIP").ok().as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off"))
+    {
+        return;
+    }
+    let Some(proxy) = effective_proxy(args) else { return };
+    let unset = |key: &str| std::env::var_os(key).is_none();
+    // Skip the network call when every surface is already pinned.
+    if !(unset("OBSCURA_TIMEZONE") || unset("OBSCURA_GEOLOCATION") || unset("OBSCURA_LOCALE") || unset("OBSCURA_ACCEPT_LANGUAGE")) {
+        return;
+    }
+    let endpoint = std::env::var("OBSCURA_GEOIP_ENDPOINT")
+        .ok().filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| obscura_net::geoip::DEFAULT_ENDPOINT.to_string());
+    let identity = match obscura_net::geoip::lookup_egress_identity(
+        Some(&proxy), &endpoint, obscura_net::geoip::DEFAULT_TIMEOUT,
+    ).await {
+        Some(identity) => identity,
+        None => {
+            eprintln!("geoip: identity lookup failed; continuing with defaults");
+            return;
+        }
+    };
+    // SAFETY: same as the TZ pin below — before any isolate or worker starts.
+    unsafe {
+        if let Some(tz) = &identity.timezone {
+            if unset("OBSCURA_TIMEZONE") { std::env::set_var("OBSCURA_TIMEZONE", tz); }
+        }
+        if let (Some(lat), Some(lon)) = (identity.latitude, identity.longitude) {
+            if unset("OBSCURA_GEOLOCATION") { std::env::set_var("OBSCURA_GEOLOCATION", format!("{lat},{lon}")); }
+        }
+        if let Some(locale) = &identity.locale {
+            if unset("OBSCURA_LOCALE") { std::env::set_var("OBSCURA_LOCALE", locale); }
+        }
+        if let Some(accept) = &identity.accept_language {
+            if unset("OBSCURA_ACCEPT_LANGUAGE") { std::env::set_var("OBSCURA_ACCEPT_LANGUAGE", accept); }
+        }
+    }
+    eprintln!("geoip: egress {} -> tz={:?} geo={:?},{:?} locale={:?}",
+        identity.ip, identity.timezone, identity.latitude, identity.longitude, identity.locale);
+}
+
 fn merge_user_agent(
     global_user_agent: Option<String>,
     command_user_agent: Option<String>,
@@ -421,6 +497,11 @@ fn operator_network_error(error: impl std::fmt::Display) -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Resolve the egress-IP identity before the TZ pin and before any V8
+    // isolate starts; it sets OBSCURA_TIMEZONE/GEOLOCATION/LOCALE/
+    // ACCEPT_LANGUAGE for the surfaces the operator left unpinned.
+    sync_geoip_identity(&args).await;
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
     // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
