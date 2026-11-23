@@ -177,6 +177,12 @@ impl BrowserContext {
             }
         }
 
+        // Import cookies from real browser profiles when the CLI asked for it
+        // (--chrome-profile / --firefox-profile set the OBSCURA_*_PROFILE env
+        // vars). Runs after the cookies.json restore so a persisted jar and a
+        // browser import merge the same way server-sent Set-Cookie headers do.
+        obscura_net::import_cookies_from_env(&cookie_jar);
+
         let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
             proxy_url.as_deref(),

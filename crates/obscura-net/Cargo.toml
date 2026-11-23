@@ -26,6 +26,16 @@ tempfile = "3"
 psl = "2"
 futures-util = "0.3"
 base64 = { workspace = true }
+# Browser-profile cookie import (cookie_import.rs). rusqlite is bundled so no
+# system SQLite is needed; the RustCrypto crates cover Chrome's v10/v11
+# AES-GCM values and the AES-128-CBC key wrap in Local State.
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+sha2 = "0.10"
 # Page-side WebSocket transport (websocket.rs): tungstenite frame codec over
 # tokio-rustls (webpki roots, same family as reqwest's rustls-tls) plus HTTP
 # CONNECT and SOCKS5 proxy hops.
