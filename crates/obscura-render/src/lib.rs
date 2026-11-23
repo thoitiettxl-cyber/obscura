@@ -94,7 +94,11 @@ mod image_capability_tests {
 }
 
 #[cfg(feature = "paint")]
+mod disk_pool;
+#[cfg(feature = "paint")]
 mod paint;
+#[cfg(feature = "paint")]
+pub(crate) mod parkable;
 #[cfg(feature = "paint")]
 pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
