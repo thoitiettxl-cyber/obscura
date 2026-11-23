@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util"]
 
 [dependencies]
 obscura-ssrf = { workspace = true }
@@ -24,18 +24,25 @@ async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
+futures-util = "0.3"
+base64 = { workspace = true }
 # Browser-profile cookie import (cookie_import.rs). rusqlite is bundled so no
 # system SQLite is needed; the RustCrypto crates cover Chrome's v10/v11
 # AES-GCM values and the AES-128-CBC key wrap in Local State.
-rusqlite = { version = "0.32", features = ["bundled"] }
-base64 = { workspace = true }
+rusqlite = { version = "0.41", features = ["bundled"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha1 = "0.10"
 sha2 = "0.10"
-futures-util = { version = "0.3", optional = true }
+# Page-side WebSocket transport (websocket.rs): tungstenite frame codec over
+# tokio-rustls (webpki roots, same family as reqwest's rustls-tls) plus HTTP
+# CONNECT and SOCKS5 proxy hops.
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"
+tokio-socks = "0.5"
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
@@ -51,7 +58,6 @@ socket2 = "0.6"
 # rustls also uses ring; adding aws-lc-rs would make provider auto-selection
 # panic).
 rcgen = "0.13"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 # `prefix-symbols` renames BoringSSL exports to avoid clashes with system OpenSSL,
 # but the renaming is only correct on Linux and Android (per wreq's README).

@@ -19467,39 +19467,144 @@ if (typeof EventSource === 'undefined') {
 }
 
 if (typeof WebSocket === 'undefined') {
+  const _wsOps = __obscuraCore.ops;
+  const _wsBaseUrl = () => {
+    try { return _domParse("document_base_url") || _domParse("document_url") || "about:blank"; }
+    catch (e) { return "about:blank"; }
+  };
+  const _wsPageOrigin = () => {
+    try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; }
+  };
+  const _wsFire = (ws, event) => {
+    const handler = ws['on' + event.type];
+    if (typeof handler === 'function') { try { handler.call(ws, event); } catch (e) {} }
+    try { ws.dispatchEvent(event); } catch (e) {}
+  };
+  const _wsPump = async (ws) => {
+    for (;;) {
+      let event;
+      try {
+        const pending = _wsOps.op_ws_recv(ws._rid);
+        // A quiet socket must not keep the page's event loop alive: the recv
+        // promise is unref'd, so an idle WebSocket never blocks settle.
+        __obscuraCore.unrefOpPromise(pending);
+        event = await pending;
+      } catch (e) { event = { type: 'error', message: String(e) }; }
+      if (!event || ws._rid === undefined) break;
+      if (event.type === 'message') {
+        let data = event.data;
+        if (event.binary !== undefined) {
+          const bytes = event.binary instanceof Uint8Array ? event.binary
+            : new Uint8Array(event.binary);
+          data = ws.binaryType === 'blob' ? new Blob([bytes]) : bytes.buffer;
+        }
+        _wsFire(ws, new MessageEvent('message', { data }));
+      } else if (event.type === 'close') {
+        ws._rid = undefined;
+        ws.readyState = 3; // CLOSED
+        const close = new Event('close');
+        close.code = event.code; close.reason = event.reason; close.wasClean = !!event.wasClean;
+        _wsFire(ws, close);
+        break;
+      } else if (event.type === 'error') {
+        // Browsers surface transport failures as an opaque 'error' event
+        // followed by 'close' (1006); the driver follows with a close event
+        // when the peer replies, so do not synthesize one here.
+        _wsFire(ws, new Event('error'));
+      }
+    }
+  };
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      // Validate URL scheme per spec: Chrome throws SyntaxError for non-ws/wss URLs
-      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
+      let resolved;
+      try {
+        resolved = new URL(String(url), _wsBaseUrl()).href;
+      } catch (e) {
         throw new DOMException(
           "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
           'SyntaxError'
         );
       }
-      this.url = url;
+      if (!/^wss?:\/\//i.test(resolved)) {
+        throw new DOMException(
+          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
+          'SyntaxError'
+        );
+      }
+      const requested = protocols === undefined ? []
+        : (Array.isArray(protocols) ? protocols.map(String) : [String(protocols)]);
+      this.url = resolved;
       this.readyState = 0; // CONNECTING
       this.bufferedAmount = 0;
       this.binaryType = 'blob';
       this.extensions = '';
-      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
+      this.protocol = '';
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+      this._rid = undefined;
       _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      _wsOps.op_ws_connect(resolved, requested, _wsPageOrigin(), _realmFrameId)
+        .then((opened) => {
+          if (this.readyState !== 0) return;
+          this.readyState = 1; // OPEN
+          this.protocol = opened.protocol || '';
+          this._rid = opened.rid;
+          _wsFire(this, new Event('open'));
+          _wsPump(this);
+        })
+        .catch(() => {
+          if (this.readyState !== 0) return;
+          this.readyState = 3; // CLOSED
+          _wsFire(this, new Event('error'));
+          const close = new Event('close');
+          close.code = 1006; close.reason = ''; close.wasClean = false;
+          _wsFire(this, close);
+        });
     }
-    send(data) { /* drop; no real socket */ }
+    send(data) {
+      if (this.readyState === 0) {
+        throw new DOMException(
+          "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.",
+          'InvalidStateError'
+        );
+      }
+      if (this.readyState !== 1 || this._rid === undefined) return;
+      if (typeof data === 'string') {
+        _wsOps.op_ws_send_text(this._rid, data);
+      } else if (data instanceof Blob) {
+        data.arrayBuffer().then((buffer) => {
+          if (this._rid !== undefined) _wsOps.op_ws_send_binary(this._rid, new Uint8Array(buffer));
+        });
+      } else if (data instanceof ArrayBuffer) {
+        _wsOps.op_ws_send_binary(this._rid, new Uint8Array(data));
+      } else if (ArrayBuffer.isView(data)) {
+        _wsOps.op_ws_send_binary(
+          this._rid,
+          new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        );
+      }
+    }
     close(code, reason) {
       if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      if (code !== undefined && !(code === 1000 || (code >= 3000 && code <= 4999))) {
+        throw new DOMException(
+          "Failed to execute 'close' on 'WebSocket': The code must be either 1000, or between 3000 and 4999. " + code + " is neither.",
+          'InvalidAccessError'
+        );
+      }
+      const wasOpen = this.readyState === 1;
+      this.readyState = 2; // CLOSING
+      if (this._rid !== undefined) {
+        _wsOps.op_ws_close(this._rid, code === undefined ? 1000 : code, String(reason || ''));
+      }
+      if (!wasOpen) {
+        // Closing before open finished: no close event is coming from the
+        // driver (there may be no socket yet); settle locally.
+        this._rid = undefined;
+        this.readyState = 3; // CLOSED
+        const close = new Event('close');
+        close.code = 1000; close.reason = ''; close.wasClean = true;
+        _wsFire(this, close);
+      }
     }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };

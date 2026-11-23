@@ -26216,8 +26216,10 @@ mod tests {
         ]));
     }
 
-    #[test]
-    fn custom_event_targets_demote_redispatched_browser_events() {
+    // Constructing a WebSocket spawns async ops, which need a Tokio reactor at
+    // the op call site (deno_unsync::spawn -> tokio::task::spawn).
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_event_targets_demote_redispatched_browser_events() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"(() => {
             const targets = [new XMLHttpRequest(), new AbortController().signal,
