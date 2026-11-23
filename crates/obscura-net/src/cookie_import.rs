@@ -9,6 +9,7 @@
 //! picks the import up the same way:
 //!   - `OBSCURA_CHROME_PROFILE`   Chrome/Chromium profile directory
 //!   - `OBSCURA_FIREFOX_PROFILE`  Firefox profile directory
+//!   - `OBSCURA_COOKIES_FILE`     Netscape cookies.txt file (curl/wget format)
 //!   - `OBSCURA_CHROME_KEY`       `auto` (default), `peanuts`,
 //!                                `base64:<raw-key>`, or `system` (macOS)
 //!
@@ -70,6 +71,7 @@ impl ChromeKey {
 pub struct ImportReport {
     pub chrome: usize,
     pub firefox: usize,
+    pub netscape: usize,
     /// Human-readable per-source failure descriptions (empty when a source
     /// was not requested or succeeded).
     pub failures: Vec<String>,
@@ -122,7 +124,79 @@ pub fn import_from_env(jar: &CookieJar) -> ImportReport {
             }
         }
     }
+    if let Ok(file) = std::env::var("OBSCURA_COOKIES_FILE") {
+        let file = file.trim();
+        if !file.is_empty() {
+            match import_netscape_file(Path::new(file), jar) {
+                Ok(n) => {
+                    report.netscape = n;
+                    tracing::info!("Imported {} Netscape cookies from {}", n, file);
+                }
+                Err(e) => {
+                    report.failures.push(format!("Netscape cookie file {file}: {e}"));
+                    tracing::warn!("Netscape cookie import from {} failed: {}", file, e);
+                }
+            }
+        }
+    }
     report
+}
+
+/// Parse a Netscape `cookies.txt` document (curl/wget/browser-export format)
+/// into `(CookieInfo, host_only)` pairs, following camofox's
+/// parseNetscapeCookieFile semantics:
+/// - `#HttpOnly_<domain>` rows mark the cookie httpOnly; other `#` lines are
+///   comments.
+/// - A leading-dot domain is domain-scoped; bare hosts are host-only.
+/// - `expires` that is not a positive number (0, placeholders) means a
+///   session cookie -- mapping to `None`, not a literal 1970 expiry that
+///   would be dropped as already dead.
+pub fn parse_netscape_cookie_file(text: &str) -> Vec<(CookieInfo, bool)> {
+    let mut cookies = Vec::new();
+    for raw_line in text.trim_start_matches('\u{FEFF}').lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (http_only, working) = match line.strip_prefix("#HttpOnly_") {
+            Some(rest) => (true, rest),
+            None if line.starts_with('#') => continue,
+            None => (false, line),
+        };
+        let parts: Vec<&str> = working.split('\t').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let domain = parts[0];
+        let host_only = !domain.starts_with('.');
+        let expires = parts[4].parse::<i64>().ok().filter(|&t| t > 0);
+        cookies.push((
+            CookieInfo {
+                name: parts[5].to_string(),
+                value: parts[6..].join("\t"),
+                domain: domain.to_string(),
+                path: parts[2].to_string(),
+                secure: parts[3].eq_ignore_ascii_case("true"),
+                http_only,
+                same_site: String::new(),
+                expires,
+            },
+            host_only,
+        ));
+    }
+    cookies
+}
+
+/// Import a Netscape `cookies.txt` file into `jar`. Returns the number of
+/// cookies the jar accepted.
+pub fn import_netscape_file(path: &Path, jar: &CookieJar) -> Result<usize, ImportError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        ImportError::new(format!("cannot read {}: {e}", path.display()))
+    })?;
+    let parsed = parse_netscape_cookie_file(&text);
+    let n = parsed.len();
+    jar.set_cookies_from_cdp_with_scope(parsed);
+    Ok(n)
 }
 
 /// Import cookies from a Chrome/Chromium profile directory (the directory
@@ -676,5 +750,53 @@ mod tests {
         let n = import_firefox_profile(dir.path(), &jar).unwrap();
         assert_eq!(n, 1);
         assert_eq!(jar_header(&jar, "http://example.org/"), "ff=v");
+    }
+
+    #[test]
+    fn netscape_file_parses_httponly_scope_and_session_cookies() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64 + 3600;
+        let text = format!(
+            "# Netscape HTTP Cookie File\n\
+             .example.com\tTRUE\t/\tTRUE\t{future}\tsess\tabc\n\
+             #HttpOnly_httpbin.org\tFALSE\t/api\tFALSE\t0\ttoken\txyz\n\
+             other.test\tFALSE\t/\tFALSE\tnotanum\tsplit\tva\tlue\n"
+        );
+        let parsed = parse_netscape_cookie_file(&text);
+        assert_eq!(parsed.len(), 3);
+        // Dotted domain is domain-scoped.
+        assert_eq!(parsed[0].0.domain, ".example.com");
+        assert!(!parsed[0].1);
+        assert_eq!(parsed[0].0.expires, Some(future));
+        // #HttpOnly_ prefix sets httpOnly; expires=0 maps to session (None).
+        assert_eq!(parsed[1].0.domain, "httpbin.org");
+        assert!(parsed[1].0.http_only);
+        assert_eq!(parsed[1].0.expires, None);
+        assert!(parsed[1].1);
+        // Extra tabs stay in the value; non-numeric expires is a session cookie.
+        assert_eq!(parsed[2].0.value, "va\tlue");
+        assert_eq!(parsed[2].0.expires, None);
+
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp_with_scope(parsed);
+        assert_eq!(jar_header(&jar, "http://sub.example.com/"), "sess=abc");
+        assert_eq!(jar_header(&jar, "http://httpbin.org/api"), "token=xyz");
+    }
+
+    #[test]
+    fn netscape_import_reads_files_and_reports_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cookies.txt");
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64 + 3600;
+        std::fs::write(&file, format!(".a.test\tTRUE\t/\tFALSE\t{future}\tc\tv\n")).unwrap();
+        let jar = CookieJar::new();
+        assert_eq!(import_netscape_file(&file, &jar).unwrap(), 1);
+        assert_eq!(jar_header(&jar, "http://a.test/"), "c=v");
+        assert!(import_netscape_file(&dir.path().join("missing.txt"), &jar).is_err());
     }
 }
