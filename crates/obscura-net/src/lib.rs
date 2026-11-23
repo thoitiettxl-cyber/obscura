@@ -2,6 +2,7 @@ pub mod client;
 mod document_progress;
 pub use document_progress::{DocumentInterruption, DocumentProgress, DocumentRequest, DocumentResponse, InterruptedDocument};
 pub mod cookies;
+pub mod cookie_import;
 pub mod encoding;
 pub mod websocket;
 pub mod interceptor;
@@ -18,6 +19,7 @@ pub use client::{
 pub use cookies::{
     canonical_domain, default_cookie_path, same_site, CookieInfo, CookieJar, SameSiteContext,
 };
+pub use cookie_import::{import_from_env as import_cookies_from_env, ChromeKey, ImportReport};
 pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,

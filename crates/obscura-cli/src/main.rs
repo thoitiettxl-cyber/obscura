@@ -50,6 +50,27 @@ struct Args {
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
 
+    /// Import cookies from a Chrome/Chromium profile directory (the dir that
+    /// holds `Cookies` or `Network/Cookies`, e.g. `~/.config/google-chrome/Default`)
+    /// into every browser context. Lets a run reuse an authenticated session
+    /// from the desktop browser. Global: fetch, scrape, serve, and mcp.
+    /// Equivalent to `OBSCURA_CHROME_PROFILE`.
+    #[arg(long, global = true, value_name = "DIR")]
+    chrome_profile: Option<std::path::PathBuf>,
+
+    /// Import cookies from a Firefox profile directory (the dir holding
+    /// `cookies.sqlite`). Global: fetch, scrape, serve, and mcp.
+    /// Equivalent to `OBSCURA_FIREFOX_PROFILE`.
+    #[arg(long, global = true, value_name = "DIR")]
+    firefox_profile: Option<std::path::PathBuf>,
+
+    /// Key source for decrypting Chrome cookies: `auto` (default; reads the
+    /// profile's Local State and falls back to the legacy Linux "peanuts" key;
+    /// on macOS uses the Keychain), `peanuts`, `base64:<raw-key>`, or `system`
+    /// (macOS only). Equivalent to `OBSCURA_CHROME_KEY`.
+    #[arg(long, global = true, requires = "chrome_profile")]
+    chrome_key: Option<String>,
+
     /// Permit fetches to loopback, RFC1918, and link-local addresses.
     /// Default is to block them (SSRF fix from #4). Use this for local
     /// development against http://localhost:N or http://192.168.x.y.
@@ -446,6 +467,26 @@ async fn run_cli() -> anyhow::Result<()> {
         // threaded at this point.
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+
+    // Browser-profile cookie import: mirror the flags into env vars so every
+    // BrowserContext created in this process (and scrape workers, which
+    // inherit the parent env) imports the same cookies on creation.
+    // SAFETY: same as above — still single threaded here.
+    unsafe {
+        if let Some(ref dir) = args.chrome_profile {
+            std::env::set_var("OBSCURA_CHROME_PROFILE", dir);
+        }
+        if let Some(ref dir) = args.firefox_profile {
+            std::env::set_var("OBSCURA_FIREFOX_PROFILE", dir);
+        }
+        if let Some(ref key) = args.chrome_key {
+            if let Err(e) = obscura_net::ChromeKey::parse(key) {
+                eprintln!("Invalid --chrome-key: {}", e);
+                std::process::exit(2);
+            }
+            std::env::set_var("OBSCURA_CHROME_KEY", key);
         }
     }
 
@@ -1579,6 +1620,15 @@ async fn run_fetch(
     Ok(())
 }
 
+/// Fresh jar seeded from the browser-profile imports the CLI flags asked
+/// for. Used by the `--dump original` raw path, which never builds a
+/// BrowserContext (where the same import runs via _new_inner).
+fn imported_cookie_jar() -> Arc<obscura_net::CookieJar> {
+    let jar = Arc::new(obscura_net::CookieJar::new());
+    obscura_net::import_cookies_from_env(&jar);
+    jar
+}
+
 async fn fetch_original_response(
     url_str: &str,
     proxy: Option<String>,
@@ -1605,7 +1655,7 @@ async fn fetch_original_response(
             // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
             // honours.
             let client = obscura_net::StealthHttpClient::with_proxy(
-                Arc::new(obscura_net::CookieJar::new()),
+                imported_cookie_jar(),
                 proxy.as_deref(),
                 false,
             )
@@ -1619,7 +1669,7 @@ async fn fetch_original_response(
     }
 
     let client = obscura_net::ObscuraHttpClient::with_options(
-        Arc::new(obscura_net::CookieJar::new()),
+        imported_cookie_jar(),
         proxy.as_deref(),
     );
     // Same local-user opt-in as `fetch`: `--dump original file://...` reads
