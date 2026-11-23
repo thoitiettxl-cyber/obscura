@@ -538,6 +538,29 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 }
             },
             {
+                "name": "browser_structure",
+                "description": "Return a structured view of the page's forms and tables as JSON: form fields with labels/roles/disabled state, select options, submit controls, and table headers with row previews. Sensitive fields (password, token, api key, card, ...) never report a value. Controls carry the same ref as browser_snapshot where one exists.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "max_chars": { "type": "number", "description": "Character budget for the JSON (default 4000); the last ~12% is kept as a tail" },
+                        "offset": { "type": "number", "minimum": 0, "description": "Character offset into the full JSON for paging (default 0)" }
+                    }
+                }
+            },
+            {
+                "name": "browser_table_rows",
+                "description": "Read rows of one table advertised by browser_structure, paginated by row offset. Rowspan/colspan are expanded so rows align with the header fields. Tables containing credential inputs are rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["table_id"],
+                    "properties": {
+                        "table_id": { "type": "string", "description": "Table id from browser_structure (element id or positional table-N)" },
+                        "offset": { "type": "number", "minimum": 0, "description": "Row offset for paging (default 0)" }
+                    }
+                }
+            },
+            {
                 "name": "browser_back",
                 "description": "Navigate back in the page history (equivalent to the browser back button).",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -853,6 +876,8 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_wait_for_text" => tool_wait_for_text(args, state).await,
         // Tier 2 agent-UX additions
         "browser_detect_forms" => tool_detect_forms(state),
+        "browser_structure" => tool_structure(args, state),
+        "browser_table_rows" => tool_table_rows(args, state),
         "browser_fill_form" => tool_fill_form(args, state).await,
         "browser_scroll" => tool_scroll(args, state),
         "browser_get_attribute" => tool_get_attribute(args, state),
@@ -1722,6 +1747,9 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
                     if (lab) label = (lab.innerText || lab.textContent || '').trim();
                 }
                 if (!label) label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+                // Same redaction as browser_structure: sensitive fields never report a value.
+                var sensitive = type === 'password'
+                    || /(pass(?:word)?|secret|token|api[_-]?key|auth|credential|card|cvv)/i.test((el.id || '') + ' ' + name + ' ' + (el.getAttribute('autocomplete') || ''));
                 var opts = null;
                 if (tag === 'select') {
                     opts = [];
@@ -1734,7 +1762,7 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
                     tag: tag,
                     type: type,
                     name: name,
-                    value: el.value || '',
+                    value: sensitive ? null : (el.value || ''),
                     checked: el.checked || false,
                     required: el.required || false,
                     label: label.trim().slice(0, 100),
@@ -1758,6 +1786,363 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
         return Ok("No forms found.".to_string());
     }
     serde_json::to_string_pretty(&val).map_err(|e| e.to_string())
+}
+
+// ---- page-structure extraction (port of camofox lib/page-structure.js) ----
+// Read-only structured view of forms and tables, with sensitive-field value
+// redaction. Implemented natively on DomTree (no JS round-trip).
+
+const STRUCTURE_MAX_FORMS: usize = 20;
+const STRUCTURE_MAX_FIELDS: usize = 50;
+const STRUCTURE_MAX_TABLES: usize = 10;
+const STRUCTURE_MAX_ROWS: usize = 50;
+const STRUCTURE_MAX_ROWS_READ: usize = 200;
+const STRUCTURE_MAX_CELLS: usize = 20;
+const STRUCTURE_MAX_OPTIONS: usize = 50;
+const STRUCTURE_MAX_TEXT: usize = 300;
+
+fn structure_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(STRUCTURE_MAX_TEXT).collect()
+}
+
+/// camofox SENSITIVE_FIELD_PATTERN: /(pass(?:word)?|secret|token|api[_-]?key|
+/// auth|credential|card|cvv)/i over `id name autocomplete`, plus type=password.
+fn structure_is_sensitive(dom: &obscura_dom::DomTree, node: NodeId) -> bool {
+    let Some(node) = dom.get_node(node) else { return false };
+    if node.get_attribute("type").is_some_and(|t| t.eq_ignore_ascii_case("password")) {
+        return true;
+    }
+    let haystack = format!("{} {} {}",
+        node.get_attribute("id").unwrap_or(""),
+        node.get_attribute("name").unwrap_or(""),
+        node.get_attribute("autocomplete").unwrap_or(""))
+        .to_lowercase();
+    ["pass", "secret", "token", "apikey", "api_key", "api-key", "auth", "credential", "card", "cvv"]
+        .iter().any(|needle| haystack.contains(needle))
+}
+
+/// Label chain: aria-label -> aria-labelledby -> label[for] -> wrapping <label>
+/// -> title/name/id. `labels_by_for` maps `for` attr to label node, built once
+/// per call instead of a document query per control.
+fn structure_label(dom: &obscura_dom::DomTree, node_id: NodeId, labels_by_for: &HashMap<String, NodeId>) -> String {
+    let attr = |name: &str| dom.get_node(node_id).and_then(|n| n.get_attribute(name).map(str::to_owned));
+    if let Some(aria) = attr("aria-label") {
+        if !aria.trim().is_empty() { return structure_text(&aria); }
+    }
+    if let Some(ids) = attr("aria-labelledby") {
+        let labels: Vec<String> = ids.split_whitespace()
+            .filter_map(|id| dom.get_element_by_id(id))
+            .map(|label| structure_text(&dom.text_content(label)))
+            .filter(|label| !label.is_empty())
+            .collect();
+        if !labels.is_empty() { return labels.join(" "); }
+    }
+    if let Some(id) = attr("id") {
+        if let Some(label) = labels_by_for.get(&id) {
+            let text = structure_text(&dom.text_content(*label));
+            if !text.is_empty() { return text; }
+        }
+    }
+    for ancestor in dom.ancestors(node_id) {
+        let is_label = dom.get_node(ancestor)
+            .and_then(|n| n.as_element().map(|q| q.local.as_ref() == "label"))
+            .unwrap_or(false);
+        if is_label { return structure_text(&dom.text_content(ancestor)); }
+    }
+    structure_text(&attr("title").or_else(|| attr("name")).or_else(|| attr("id")).unwrap_or_default())
+}
+
+fn structure_disabled(dom: &obscura_dom::DomTree, node_id: NodeId) -> bool {
+    if dom.get_node(node_id).map(|n| n.get_attribute("disabled").is_some()).unwrap_or(false) { return true; }
+    // A control inside a disabled fieldset is disabled too.
+    dom.ancestors(node_id).iter().any(|&ancestor| {
+        dom.get_node(ancestor)
+            .map(|n| n.as_element().is_some_and(|q| q.local.as_ref() == "fieldset")
+                && n.get_attribute("disabled").is_some())
+            .unwrap_or(false)
+    })
+}
+
+/// The value the page would report for the control: live form-control state
+/// first, then the attribute, then textarea text content.
+fn structure_value(dom: &obscura_dom::DomTree, node_id: NodeId) -> String {
+    if let Some(value) = dom.form_control_state(node_id).and_then(|s| s.value) {
+        if !value.is_empty() { return structure_text(&value); }
+    }
+    if let Some(value) = dom.get_node(node_id).and_then(|n| n.get_attribute("value").map(str::to_owned)) {
+        return structure_text(&value);
+    }
+    let is_textarea = dom.get_node(node_id)
+        .and_then(|n| n.as_element().map(|q| q.local.as_ref() == "textarea"))
+        .unwrap_or(false);
+    if is_textarea { return structure_text(&dom.text_content(node_id)); }
+    String::new()
+}
+
+fn structure_labels_by_for(dom: &obscura_dom::DomTree) -> HashMap<String, NodeId> {
+    dom.query_selector_all("label").unwrap_or_default().into_iter()
+        .filter_map(|label| {
+            let for_attr = dom.get_node(label).and_then(|n| n.get_attribute("for").map(str::to_owned))?;
+            Some((for_attr, label))
+        })
+        .collect()
+}
+
+fn structure_field(dom: &obscura_dom::DomTree, node_id: NodeId, labels_by_for: &HashMap<String, NodeId>) -> Value {
+    let node = dom.get_node(node_id);
+    let tag = node.as_ref()
+        .and_then(|n| n.as_element().map(|q| q.local.as_ref().to_lowercase()))
+        .unwrap_or_default();
+    let raw_type = node.as_ref()
+        .and_then(|n| n.get_attribute("type").map(str::to_lowercase))
+        .unwrap_or_else(|| if tag == "select" { "select".to_string() } else { String::new() });
+    let role = if tag == "select" { "combobox" }
+        else if raw_type == "checkbox" { "checkbox" }
+        else if raw_type == "radio" { "radio" }
+        else { "textbox" };
+    let mut field = json!({
+        "label": structure_label(dom, node_id, labels_by_for),
+        "role": role,
+        "tag": tag,
+        "type": raw_type,
+        "disabled": structure_disabled(dom, node_id),
+    });
+    if let Some(id) = node.as_ref().and_then(|n| n.get_attribute("id")) {
+        if !id.is_empty() { field["id"] = json!(id); }
+    }
+    if let Some(name) = node.as_ref().and_then(|n| n.get_attribute("name")) {
+        field["name"] = json!(name);
+    }
+    if let Some(reference) = node.as_ref().and_then(|n| n.get_attribute("data-obscura-ref")) {
+        field["ref"] = json!(reference);
+    }
+    // Sensitive controls and buttons/files never report a value.
+    if !structure_is_sensitive(dom, node_id) && tag != "button" && raw_type != "file" {
+        field["value"] = json!(structure_value(dom, node_id));
+    }
+    if tag == "select" {
+        let all_options = dom.select_options(node_id).unwrap_or_default();
+        let options: Vec<Value> = all_options.iter().take(STRUCTURE_MAX_OPTIONS).map(|option| {
+            let label = structure_text(&dom.text_content(*option));
+            let value = dom.get_node(*option)
+                .and_then(|n| n.get_attribute("value").map(str::to_owned))
+                .unwrap_or_else(|| label.clone());
+            let selected = dom.get_node(*option).map(|n| n.get_attribute("selected").is_some()).unwrap_or(false)
+                || dom.form_control_state(*option).is_some_and(|s| s.checked == Some(true));
+            json!({ "label": label, "value": value, "selected": selected })
+        }).collect();
+        field["options"] = json!(options);
+        field["optionsTruncated"] = json!(all_options.len() > STRUCTURE_MAX_OPTIONS);
+    }
+    field
+}
+
+fn extract_page_structure(dom: &obscura_dom::DomTree) -> Value {
+    let labels_by_for = structure_labels_by_for(dom);
+    let all_forms = dom.query_selector_all("form").unwrap_or_default();
+    let forms: Vec<Value> = all_forms.iter().take(STRUCTURE_MAX_FORMS).map(|form| {
+        let elements: Vec<NodeId> = dom.query_selector_all_from(*form, "input, select, textarea")
+            .unwrap_or_default().into_iter()
+            .filter(|el| {
+                let tag = dom.get_node(*el).and_then(|n| n.as_element().map(|q| q.local.as_ref().to_lowercase()));
+                let ty = dom.get_node(*el).and_then(|n| n.get_attribute("type").map(str::to_lowercase)).unwrap_or_default();
+                tag.is_some_and(|t| t == "input" || t == "select" || t == "textarea")
+                    && !matches!(ty.as_str(), "hidden" | "submit" | "reset" | "button" | "image")
+            })
+            .collect();
+        let fields: Vec<Value> = elements.iter().take(STRUCTURE_MAX_FIELDS)
+            .map(|el| structure_field(dom, *el, &labels_by_for)).collect();
+        let submit_controls: Vec<Value> = dom.query_selector_all_from(*form, "button, input[type=\"submit\"], input[type=\"image\"]")
+            .unwrap_or_default().iter().take(STRUCTURE_MAX_FIELDS).map(|el| {
+                let node = dom.get_node(*el);
+                // camofox falls back to element.value; a <button>'s visible
+                // name is its text, so fall back to text content after that.
+                let label = {
+                    let label = structure_label(dom, *el, &labels_by_for);
+                    if !label.is_empty() { label }
+                    else {
+                        let value = structure_value(dom, *el);
+                        if !value.is_empty() { value } else { structure_text(&dom.text_content(*el)) }
+                    }
+                };
+                let mut control = json!({ "label": label, "disabled": structure_disabled(dom, *el) });
+                if let Some(id) = node.as_ref().and_then(|n| n.get_attribute("id")) {
+                    if !id.is_empty() { control["id"] = json!(id); }
+                }
+                if let Some(name) = node.as_ref().and_then(|n| n.get_attribute("name")) {
+                    control["name"] = json!(name);
+                }
+                if let Some(reference) = node.as_ref().and_then(|n| n.get_attribute("data-obscura-ref")) {
+                    control["ref"] = json!(reference);
+                }
+                control
+            }).collect();
+        let node = dom.get_node(*form);
+        let mut entry = json!({
+            "method": node.as_ref().and_then(|n| n.get_attribute("method")).unwrap_or("get").to_lowercase(),
+            "fields": fields,
+            "fieldsTruncated": elements.len() > STRUCTURE_MAX_FIELDS,
+            "submitControls": submit_controls,
+        });
+        let label = structure_label(dom, *form, &labels_by_for);
+        if !label.is_empty() { entry["label"] = json!(label); }
+        if let Some(id) = node.as_ref().and_then(|n| n.get_attribute("id")) {
+            if !id.is_empty() { entry["id"] = json!(id); }
+        }
+        if let Some(name) = node.as_ref().and_then(|n| n.get_attribute("name")) {
+            entry["name"] = json!(name);
+        }
+        entry
+    }).collect();
+
+    let all_tables = dom.query_selector_all("table").unwrap_or_default();
+    let tables: Vec<Value> = all_tables.iter().take(STRUCTURE_MAX_TABLES).enumerate().map(|(index, table)| {
+        let node = dom.get_node(*table);
+        let table_id = node.as_ref().and_then(|n| n.get_attribute("id")).filter(|id| !id.is_empty())
+            .map(str::to_owned).unwrap_or_else(|| format!("table-{}", index + 1));
+        let headers: Vec<String> = dom.query_selector_all_from(*table, "thead th").unwrap_or_default()
+            .iter().map(|cell| structure_text(&dom.text_content(*cell))).collect();
+        let rows = dom.query_selector_all_from(*table, "tbody tr").unwrap_or_default();
+        let visible_rows: Vec<Vec<String>> = rows.iter().take(STRUCTURE_MAX_ROWS).map(|row| {
+            dom.query_selector_all_from(*row, "th, td").unwrap_or_default()
+                .iter().take(STRUCTURE_MAX_CELLS).map(|cell| structure_text(&dom.text_content(*cell))).collect()
+        }).collect();
+        let mut entry = json!({
+            "tableId": table_id,
+            "headers": headers,
+            "columns": headers,
+            "rowCount": rows.len(),
+            "rows": visible_rows,
+            "rowsTruncated": rows.len() > STRUCTURE_MAX_ROWS,
+        });
+        let label = structure_label(dom, *table, &labels_by_for);
+        if !label.is_empty() { entry["label"] = json!(label); }
+        if let Some(id) = node.as_ref().and_then(|n| n.get_attribute("id")) {
+            if !id.is_empty() { entry["id"] = json!(id); }
+        }
+        entry
+    }).collect();
+    let evidence_limits: Vec<Value> = tables.iter().map(|table| json!({
+        "source": "table",
+        "tableId": table["tableId"],
+        "tableLabel": table.get("label"),
+        "availableDimensions": table["headers"],
+        "visibleRowCount": table["rowCount"],
+        "rowsTruncated": table["rowsTruncated"],
+    })).collect();
+    json!({
+        "forms": forms,
+        "formsTruncated": all_forms.len() > STRUCTURE_MAX_FORMS,
+        "tables": tables,
+        "tablesTruncated": all_tables.len() > STRUCTURE_MAX_TABLES,
+        "evidenceLimits": evidence_limits,
+    })
+}
+
+fn tool_structure(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(DEFAULT_TEXT_LIMIT);
+    let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(0);
+    rebuild_interactive_refs(state)?;
+    let structure = state.page_mut().with_dom(|dom| extract_page_structure(dom)).unwrap_or_else(|| json!({}));
+    let text = serde_json::to_string_pretty(&structure).map_err(|e| e.to_string())?;
+    Ok(window_text(&text, max_chars, offset))
+}
+
+/// Row-paginated read of one advertised table, with rowspan/colspan expanded
+/// so every row aligns cell-for-cell with the headers. Tables containing
+/// credential inputs are not a data source.
+fn tool_table_rows(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let requested_id = args.get("table_id").and_then(Value::as_str)
+        .or_else(|| args.get("tableId").and_then(Value::as_str))
+        .ok_or("Missing table_id parameter")?;
+    let requested_offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let page = state.page_mut();
+    page.with_dom(|dom| {
+        let tables = dom.query_selector_all("table").unwrap_or_default();
+        // Resolve against the same ids extract_page_structure advertises:
+        // the element id when present, else the positional `table-N` fallback.
+        let index = tables.iter().take(STRUCTURE_MAX_TABLES).enumerate().find_map(|(i, table)| {
+            let id = dom.get_node(*table)
+                .and_then(|n| n.get_attribute("id").filter(|id| !id.is_empty()).map(str::to_owned))
+                .unwrap_or_else(|| format!("table-{}", i + 1));
+            (id == requested_id).then_some(i)
+        });
+        let Some(index) = index else {
+            return Err(format!("Table not found or exceeds the {STRUCTURE_MAX_TABLES}-table limit: {requested_id}"));
+        };
+        let table = tables[index];
+        // A table that holds sensitive controls is not a readable data source.
+        let sensitive_table = dom.query_selector_all_from(table, "input").unwrap_or_default().iter().any(|input| {
+            dom.get_node(*input).map(|n| {
+                n.get_attribute("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))
+                    || ["password", "secret", "token", "api_key"].iter().any(|needle| {
+                        n.get_attribute("name").unwrap_or("").to_lowercase().contains(needle)
+                    })
+            }).unwrap_or(false)
+        });
+        if sensitive_table {
+            return Err(format!("Table {requested_id} contains credential inputs and is not a data source"));
+        }
+
+        // Expand rowspan/colspan: carry a cell's value down through the rows it spans.
+        let dom_rows = dom.query_selector_all_from(table, "tbody tr").unwrap_or_default();
+        let start = requested_offset.min(dom_rows.len());
+        let mut carry: HashMap<usize, (String, usize)> = HashMap::new();
+        let mut grid: Vec<Vec<String>> = Vec::new();
+        for row in dom_rows.iter().take(start + STRUCTURE_MAX_ROWS_READ) {
+            let cells_dom = dom.query_selector_all_from(*row, "th, td").unwrap_or_default();
+            let mut cells: Vec<String> = Vec::new();
+            let mut column = 0usize;
+            let mut cell_index = 0usize;
+            while cell_index < cells_dom.len() || carry.contains_key(&column) {
+                if let Some((value, remaining)) = carry.get_mut(&column) {
+                    cells.push(value.clone());
+                    *remaining -= 1;
+                    if *remaining == 0 { carry.remove(&column); }
+                    column += 1;
+                    continue;
+                }
+                let cell = cells_dom[cell_index];
+                cell_index += 1;
+                let value = structure_text(&dom.text_content(cell));
+                let (col_span, row_span) = dom.get_node(cell).map(|n| {
+                    (n.get_attribute("colspan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1),
+                     n.get_attribute("rowspan").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1))
+                }).unwrap_or((1, 1));
+                for span_offset in 0..col_span {
+                    let cell_value = if span_offset == 0 { value.clone() } else { String::new() };
+                    cells.push(cell_value.clone());
+                    if row_span > 1 { carry.insert(column + span_offset, (cell_value, row_span - 1)); }
+                }
+                column += col_span;
+            }
+            grid.push(cells.into_iter().take(STRUCTURE_MAX_CELLS).collect());
+        }
+        let total_rows = dom_rows.len();
+        let returned: Vec<Vec<String>> = grid.into_iter().skip(start).take(STRUCTURE_MAX_ROWS_READ).collect();
+        let next_offset = start + returned.len();
+        let node = dom.get_node(table);
+        let label = node.as_ref()
+            .and_then(|n| n.get_attribute("aria-label").or_else(|| n.get_attribute("title")).or_else(|| n.get_attribute("name")).or_else(|| n.get_attribute("id")))
+            .map(structure_text);
+        let fields: Vec<String> = dom.query_selector_all_from(table, "thead th").unwrap_or_default()
+            .iter().map(|cell| structure_text(&dom.text_content(*cell))).collect();
+        let table_id = node.as_ref().and_then(|n| n.get_attribute("id")).filter(|id| !id.is_empty())
+            .map(str::to_owned).unwrap_or_else(|| format!("table-{}", index + 1));
+        Ok(serde_json::to_string_pretty(&json!({
+            "tableId": table_id,
+            "label": label,
+            "fields": fields,
+            "totalRows": total_rows,
+            "offset": start,
+            "rows": returned,
+            "pagination": {
+                "available": next_offset < total_rows,
+                "unit": "row",
+                "nextOffset": if next_offset < total_rows { json!(next_offset) } else { Value::Null },
+            },
+        })).map_err(|e| e.to_string())?)
+    }).unwrap_or_else(|| Err("No DOM available".to_string()))
 }
 
 /// Fill multiple fields in one call. Each entry: {ref|selector, value, type?}.
@@ -2676,6 +3061,75 @@ mod tests {
                 assert!(line.contains("role=button"), "no ref line may be split: {line:?}");
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_reports_forms_and_redacts_sensitive_values() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(concat!(
+            "data:text/html,<form id=login method=post>",
+            "<label for=u>Username</label><input id=u name=user value=bob>",
+            "<label for=p>Password</label><input id=p type=password name=password value=hunter2>",
+            "<input name=api_token autocomplete=off value=sekrit>",
+            "<select name=plan><option value=free>Free</option><option value=pro selected>Pro</option></select>",
+            "<button type=submit>Sign in</button>",
+            "</form>",
+            "<table id=prices><thead><tr><th>Item</th><th>Cost</th></tr></thead>",
+            "<tbody><tr><td>pen</td><td>3</td></tr><tr><td>book</td><td>9</td></tr></tbody></table>",
+        )).await.unwrap();
+        let out = tool_structure(&json!({"max_chars": 1000000}), &mut state).unwrap();
+        let structure: Value = serde_json::from_str(&out).unwrap();
+        let fields = structure["forms"][0]["fields"].as_array().unwrap();
+        let by_name = |name: &str| fields.iter().find(|f| f["name"] == name).cloned().unwrap();
+        assert_eq!(by_name("user")["label"], "Username");
+        assert_eq!(by_name("user")["value"], "bob");
+        let password = by_name("password");
+        assert_eq!(password["label"], "Password");
+        assert!(password.get("value").is_none(), "password value must be redacted: {password}");
+        assert!(by_name("api_token").get("value").is_none(), "token-ish names are redacted: {fields:?}");
+        let plan = by_name("plan");
+        assert_eq!(plan["role"], "combobox");
+        assert_eq!(plan["options"][1]["selected"], true);
+        assert!(structure["forms"][0]["submitControls"][0]["label"].as_str().unwrap().contains("Sign in"));
+        assert!(fields.iter().all(|f| f.get("ref").is_some()), "controls should carry snapshot refs: {fields:?}");
+        let table = &structure["tables"][0];
+        assert_eq!(table["tableId"], "prices");
+        assert_eq!(table["headers"], json!(["Item", "Cost"]));
+        assert_eq!(table["rowCount"], 2);
+        assert_eq!(table["rows"][1], json!(["book", "9"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_table_rows_expands_spans_and_pages() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(concat!(
+            "data:text/html,<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody>",
+            "<tr><td rowspan=2>r1a</td><td>r1b</td></tr>",
+            "<tr><td>r2b</td></tr>",
+            "<tr><td colspan=2>r3ab</td></tr>",
+            "</tbody></table>",
+        )).await.unwrap();
+        let first = tool_table_rows(&json!({"table_id": "table-1", "offset": 0}), &mut state).unwrap();
+        let page: Value = serde_json::from_str(&first).unwrap();
+        let rows = page["rows"].as_array().unwrap();
+        assert_eq!(rows[0], json!(["r1a", "r1b"]));
+        assert_eq!(rows[1], json!(["r1a", "r2b"]), "rowspan value carries into the next row");
+        assert_eq!(rows[2], json!(["r3ab", ""]), "colspan fills remaining cells with empty text");
+        assert_eq!(page["pagination"]["available"], false);
+        let second = tool_table_rows(&json!({"table_id": "table-1", "offset": 2}), &mut state).unwrap();
+        let page: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(page["offset"], 2);
+        assert_eq!(page["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(page["totalRows"], 3);
+        assert!(tool_table_rows(&json!({"table_id": "nope"}), &mut state).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_rejects_tables_with_credential_inputs() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<table><tbody><tr><td><input name=api_key value=x></td></tr></tbody></table>").await.unwrap();
+        let error = tool_table_rows(&json!({"table_id": "table-1"}), &mut state).unwrap_err();
+        assert!(error.contains("credential"), "{error}");
     }
 
     #[tokio::test(flavor = "current_thread")]
