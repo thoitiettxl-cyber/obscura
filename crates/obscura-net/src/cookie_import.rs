@@ -781,7 +781,7 @@ mod tests {
 
         let jar = CookieJar::new();
         jar.set_cookies_from_cdp_with_scope(parsed);
-        assert_eq!(jar_header(&jar, "http://sub.example.com/"), "sess=abc");
+        assert_eq!(jar_header(&jar, "https://sub.example.com/"), "sess=abc");
         assert_eq!(jar_header(&jar, "http://httpbin.org/api"), "token=xyz");
     }
 
