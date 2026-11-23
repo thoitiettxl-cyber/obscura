@@ -100,14 +100,31 @@ impl Snapshot {
                 },
                 None => root = Some(idx),
             }
-            // Push children reversed so the stack pops them in document order.
-            let mut child = node.last_child;
-            while let Some(child_id) = child {
-                let previous = dom
-                    .borrow_node(child_id)
-                    .and_then(|n| n.prev_sibling);
-                stack.push((child_id, Some(idx)));
-                child = previous;
+            // Composed tree (moli parity): a shadow host renders its shadow
+            // root children in place of light DOM children, and a slot renders
+            // its assigned nodes (or its fallback children when unassigned).
+            let composed = dom.shadow_children(nid).or_else(|| {
+                dom.is_html_slot_element(nid)
+                    .then(|| dom.slot_rendered_children(nid))
+                    .flatten()
+            });
+            match composed {
+                Some(children) => {
+                    // Push children reversed so the stack pops them in order.
+                    for child_id in children.iter().rev() {
+                        stack.push((*child_id, Some(idx)));
+                    }
+                }
+                None => {
+                    let mut child = node.last_child;
+                    while let Some(child_id) = child {
+                        let previous = dom
+                            .borrow_node(child_id)
+                            .and_then(|n| n.prev_sibling);
+                        stack.push((child_id, Some(idx)));
+                        child = previous;
+                    }
+                }
             }
         }
         root.map(|root| Self { nodes, root })
@@ -233,6 +250,30 @@ mod tests {
         dom.update_form_control_state(input, |state| state.value = Some("typed".to_owned()));
         let md = render(&dom, &HashMap::new());
         assert!(md.contains("typed"), "missing control value: {md}");
+    }
+
+    #[test]
+    fn composed_tree_renders_shadow_roots_and_slots() {
+        // Light DOM children of a shadow host are hidden behind the shadow
+        // root; slot content projects through the slot's position.
+        let md = render_html(
+            "<html><body><div id='host'>\
+             <template shadowrootmode='open'><p>shadow <slot>fallback</slot></p></template>\
+             <span>assigned light</span></div></body></html>",
+        );
+        assert!(md.contains("shadow"), "missing shadow content: {md}");
+        assert!(md.contains("assigned light"), "missing slot projection: {md}");
+        assert!(!md.contains("fallback"), "unassigned fallback leaked: {md}");
+    }
+
+    #[test]
+    fn unassigned_slot_renders_fallback_children() {
+        let md = render_html(
+            "<html><body><div id='host'>\
+             <template shadowrootmode='open'><p><slot>fallback text</slot></p></template>\
+             </div></body></html>",
+        );
+        assert!(md.contains("fallback text"), "missing fallback: {md}");
     }
 
     #[test]
