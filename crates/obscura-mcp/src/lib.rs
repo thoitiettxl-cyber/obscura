@@ -1164,7 +1164,10 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
 }
 
 fn encode_query_component(query: &str) -> String {
-    url::form_urlencoded::byte_serialize(query.as_bytes()).collect()
+    // encodeURIComponent semantics: byte_serialize emits '+' for space.
+    url::form_urlencoded::byte_serialize(query.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
 // camofox lib/macros.js: a small fixed table of @macro -> URL templates.
@@ -2472,6 +2475,7 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
 
 async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str);
+    let previous_active = state.active_tab.clone();
     let id = state.new_tab();
     if let Some(u) = url {
         let ua = state.user_agent.clone();
@@ -2479,9 +2483,19 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
         if let Some(ref ua) = ua {
             page.http_client.set_user_agent(ua).await;
         }
-        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
-            .await.map_err(|e| e.to_string())?;
-        Ok(format!("Opened {id} and navigated to {}", page.url_string()))
+        // camofox new-page recovery: a failed first navigation must not leave
+        // an unregistered/orphan tab behind.
+        match page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
+            .await
+        {
+            Ok(()) => Ok(format!("Opened {id} and navigated to {}", page.url_string())),
+            Err(e) => {
+                state.tabs.remove(&id);
+                state.active_tab = previous_active.filter(|t| state.tabs.contains_key(t));
+                state.interactive_refs.clear();
+                Err(e.to_string())
+            }
+        }
     } else {
         Ok(format!("Opened {id} (about:blank)."))
     }
@@ -4108,6 +4122,19 @@ mod tests {
 
     // Every MCP route that navigates must refuse local files, not only
     // browser_navigate: the browser layer enforces it for all of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tab_new_nav_failure_leaves_no_orphan_tab() {
+        let mut state = BrowserState::new(None, None, false);
+        tool_tab_new(&json!({"url": "data:text/html,<p>kept</p>"}), &mut state).await.unwrap();
+        let kept = state.active_tab.clone().unwrap();
+        let tab_count = state.tabs.len();
+        // Unreachable host fails the navigation.
+        let result = tool_tab_new(&json!({"url": "http://127.0.0.1:9/unreachable"}), &mut state).await;
+        assert!(result.is_err(), "nav failure must surface as a tool error");
+        assert_eq!(state.tabs.len(), tab_count, "failed tab must be dropped: {:?}", state.tabs.keys());
+        assert_eq!(state.active_tab.as_deref(), Some(kept.as_str()));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mcp_tab_new_rejects_local_files() {
         let mut state = BrowserState::new(None, None, false);
