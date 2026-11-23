@@ -368,7 +368,9 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                         "dismissConsent": {
                             "type": "boolean",
                             "description": "Opt-in: after load, click a visible button of a known consent manager (OneTrust, Cookiebot, Quantcast) to dismiss its banner (default: false)"
-                        }
+                        },
+                        "macro": { "type": "string", "description": "Search macro expanding to a URL (e.g. @google_search); combined with `query`. url takes precedence when a macro yields nothing" },
+                        "query": { "type": "string", "description": "Query string interpolated into the search macro" }
                     },
                     "required": ["url"]
                 }
@@ -1103,6 +1105,17 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
     }
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
+    let macro_name = args.get("macro").and_then(Value::as_str).unwrap_or("");
+    let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+    let url = if !macro_name.is_empty()
+        && macro_name != "__NO__" && macro_name != "none" && macro_name != "null"
+    {
+        expand_search_macro(macro_name, query).unwrap_or_else(|| url.to_string())
+    } else {
+        url.to_string()
+    };
+    let url = url.as_str();
+
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
     // A timed-out load can already have replaced the document's arena.
     state.interactive_refs.clear();
@@ -1113,16 +1126,31 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
         page.http_client.set_user_agent(ua).await;
     }
 
-    page.navigate_with_wait(url, condition).await
-        .map_err(|e| {
-            let message = e.to_string();
-            if operator_hints {
-                if let Some(hint) = obscura_net::private_network_error_hint(&message) {
-                    return format!("{}\n{}", message, hint);
-                }
+    // camofox getSearchFallbacks: a google search that fails retries on
+    // duckduckgo then bing before surfacing the error.
+    let mut navigate_err = match page.navigate_with_wait(url, condition).await {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    if navigate_err.is_some() && macro_name == "@google_search" {
+        for fallback in [
+            format!("https://duckduckgo.com/?q={}", encode_query_component(query)),
+            format!("https://www.bing.com/search?q={}", encode_query_component(query)),
+        ] {
+            match page.navigate_with_wait(&fallback, condition).await {
+                Ok(()) => { navigate_err = None; break; }
+                Err(e) => navigate_err = Some(e.to_string()),
             }
-            message
-        })?;
+        }
+    }
+    if let Some(message) = navigate_err {
+        if operator_hints {
+            if let Some(hint) = obscura_net::private_network_error_hint(&message) {
+                return Err(format!("{}\n{}", message, hint));
+            }
+        }
+        return Err(message);
+    }
 
     let dismissed = args.get("dismissConsent").and_then(Value::as_bool).unwrap_or(false)
         .then(|| page.evaluate(DISMISS_CONSENT_SCRIPT).as_str().map(str::to_string))
@@ -1133,6 +1161,33 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
         summary.push_str(&format!("\nDismissed consent dialog via {selector}"));
     }
     Ok(summary)
+}
+
+fn encode_query_component(query: &str) -> String {
+    url::form_urlencoded::byte_serialize(query.as_bytes()).collect()
+}
+
+// camofox lib/macros.js: a small fixed table of @macro -> URL templates.
+fn expand_search_macro(macro_name: &str, query: &str) -> Option<String> {
+    let q = encode_query_component(query);
+    let template = match macro_name {
+        "@google_search" => format!("https://www.google.com/search?q={q}"),
+        "@youtube_search" => format!("https://www.youtube.com/results?search_query={q}"),
+        "@amazon_search" => format!("https://www.amazon.com/s?k={q}"),
+        "@reddit_search" => format!("https://www.reddit.com/search.json?q={q}&limit=25"),
+        "@reddit_subreddit" => format!("https://www.reddit.com/r/{q}.json?limit=25"),
+        "@wikipedia_search" => format!("https://en.wikipedia.org/wiki/Special:Search?search={q}"),
+        "@twitter_search" => format!("https://twitter.com/search?q={q}"),
+        "@yelp_search" => format!("https://www.yelp.com/search?find_desc={q}"),
+        "@spotify_search" => format!("https://open.spotify.com/search/{q}"),
+        "@netflix_search" => format!("https://www.netflix.com/search?q={q}"),
+        "@linkedin_search" => format!("https://www.linkedin.com/search/results/all/?keywords={q}"),
+        "@instagram_search" => format!("https://www.instagram.com/explore/tags/{q}"),
+        "@tiktok_search" => format!("https://www.tiktok.com/search?q={q}"),
+        "@twitch_search" => format!("https://www.twitch.tv/search?term={q}"),
+        _ => return None,
+    };
+    Some(template)
 }
 
 // Restrict this opt-in behavior to consent-manager controls (camofox
@@ -3504,6 +3559,22 @@ mod tests {
         restored.page_mut().navigate(&origin).await.expect("restored page");
         assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
             json!(["\0\"value\"", "\0session"]));
+    }
+
+    #[test]
+    fn search_macros_expand_query_and_fall_back_to_url() {
+        assert_eq!(
+            expand_search_macro("@google_search", "hello world").as_deref(),
+            Some("https://www.google.com/search?q=hello%20world")
+        );
+        assert_eq!(
+            expand_search_macro("@youtube_search", "a+b").as_deref(),
+            Some("https://www.youtube.com/results?search_query=a%2Bb")
+        );
+        assert_eq!(expand_search_macro("@unknown_macro", "x"), None);
+        // Values that read as "unset" skip expansion entirely.
+        let args = json!({"url": "data:text/html,<p>x</p>", "macro": "none", "query": "q"});
+        assert_eq!(args["macro"].as_str(), Some("none"));
     }
 
     #[tokio::test(flavor = "current_thread")]
