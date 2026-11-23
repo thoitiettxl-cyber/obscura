@@ -1169,7 +1169,13 @@ impl ObscuraHttpClient {
             user_agent: RwLock::new(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
             ),
-            accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
+            // OBSCURA_ACCEPT_LANGUAGE pins the header (set by --geoip or by
+            // hand); otherwise English, matching navigator.language.
+            accept_language: RwLock::new(
+                std::env::var("OBSCURA_ACCEPT_LANGUAGE").ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "en-US,en;q=0.9".to_string()),
+            ),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),

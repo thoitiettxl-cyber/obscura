@@ -1143,7 +1143,10 @@ impl Page {
             viewport: (1280.0, 720.0),
             screen_size_override: None,
             screen_metrics_emulated: false,
-            locale_override: None,
+            // OBSCURA_LOCALE pins navigator.language/languages (set by the
+            // geoip identity sync or by hand); a later CDP override wins.
+            locale_override: std::env::var("OBSCURA_LOCALE").ok()
+                .filter(|s| !s.trim().is_empty()),
             device_metrics_baseline: None,
             reduced_motion: false,
             dark_color_scheme: false,
