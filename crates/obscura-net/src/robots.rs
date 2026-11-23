@@ -1,5 +1,8 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::RwLock;
+
+use crate::inflight::Inflight;
 
 /// Origins whose robots.txt rules are kept per context; past this the oldest is
 /// evicted and refetched if visited again.
@@ -9,6 +12,8 @@ const MAX_ROBOTS_BODY_BYTES: usize = 500 * 1024;
 
 pub struct RobotsCache {
     cache: RwLock<RobotsEntries>,
+    /// Concurrent loads of the same origin's robots.txt share one fetch.
+    inflight: Inflight<String>,
 }
 
 #[derive(Default)]
@@ -28,7 +33,20 @@ impl RobotsCache {
     pub fn new() -> Self {
         RobotsCache {
             cache: RwLock::new(RobotsEntries::default()),
+            inflight: Inflight::new(),
         }
+    }
+
+    /// Runs `load` once per `domain` among concurrent callers: the first
+    /// caller fetches and stores; callers that arrive while it runs wait
+    /// for it instead of issuing a duplicate robots.txt fetch for the
+    /// same origin.
+    pub async fn load_once<F, Fut>(&self, domain: &str, load: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.inflight.coalesce(&domain.to_string(), load).await;
     }
 
     pub fn parse_and_store(&self, domain: &str, body: &str, our_agent: &str) {
