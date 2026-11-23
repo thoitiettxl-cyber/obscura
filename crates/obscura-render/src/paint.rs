@@ -80,7 +80,7 @@ impl RenderResourceLoader for HttpResourceLoader {
 
 enum CachedResource {
     Bytes {
-        bytes: Arc<[u8]>,
+        bytes: crate::parkable::ParkableBytes,
         intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
         static_raster: std::sync::OnceLock<bool>,
     },
@@ -93,7 +93,12 @@ impl CachedResource {
             Self::Bytes { bytes, intrinsic, .. } => {
                 // Metadata belongs to these immutable bytes. Replacement and
                 // FIFO eviction discard it with the existing bounded entry.
-                *intrinsic.get_or_init(|| image_intrinsic_metadata(bytes))
+                *intrinsic.get_or_init(|| {
+                    bytes
+                        .snapshot()
+                        .ok()
+                        .and_then(|bytes| image_intrinsic_metadata(&bytes))
+                })
             }
             Self::Missing(_) => None,
         }
@@ -155,7 +160,9 @@ const RASTER_PAINT_CACHE_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 
 struct CachedRasterPaint {
     resource_key: String,
-    bytes: Arc<[u8]>,
+    // Stable identity of the owning parkable bytes, so a raster stays
+    // deduplicated across park/unpark cycles of the same resource.
+    owner_id: u64,
     raster: Arc<Pixmap>,
 }
 
@@ -296,6 +303,11 @@ pub struct RenderResourceCache {
     sync_miss_keys: HashSet<String>,
     document_scoped: bool,
     html_image_requests: RefCell<HtmlImageRequests>,
+    // Idle cached bytes park into a shared temporary-file pool so long-lived
+    // pages hold less RAM without losing cache entries. Sweeps run
+    // opportunistically on cache activity (the cache is !Send).
+    parkable: crate::parkable::ParkableBytesManager,
+    last_park_sweep: std::time::Instant,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -342,6 +354,8 @@ impl RenderResourceCache {
             sync_miss_keys: HashSet::new(),
             document_scoped: false,
             html_image_requests: RefCell::new(HtmlImageRequests::default()),
+            parkable: crate::parkable::ParkableBytesManager::default(),
+            last_park_sweep: std::time::Instant::now(),
             loader: Box::new(loader),
         }
     }
@@ -786,12 +800,13 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
+    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<crate::parkable::ParkableBytesSnapshot> {
+        self.park_due();
         let url = network_resource_url(url);
         if self.stopped.contains(&url) { return None; }
         if let Some(entry) = self.entries.get(&url) {
             match entry {
-                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
+                CachedResource::Bytes { bytes, .. } => return bytes.snapshot().ok(),
                 CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
                     return None;
                 }
@@ -807,8 +822,16 @@ impl RenderResourceCache {
         let loaded = self.loader.load(&url).map(Arc::<[u8]>::from);
         match loaded {
             Some(bytes) => {
-                self.insert_bytes(url, Arc::clone(&bytes));
-                Some(bytes)
+                self.insert_bytes(url.clone(), Arc::clone(&bytes));
+                self.entries.get(&url).and_then(|entry| match entry {
+                    CachedResource::Bytes { bytes, .. } => bytes.snapshot().ok(),
+                    _ => None,
+                }).or_else(|| {
+                    // Disabled/over-budget caches still serve the fetched bytes.
+                    crate::parkable::ParkableBytes::unmanaged(bytes)
+                        .snapshot()
+                        .ok()
+                })
             }
             None => {
                 self.insert_missing(url);
@@ -817,12 +840,13 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
+    fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<crate::parkable::ParkableBytesSnapshot> {
+        self.park_due();
         let key = image_resource_key(url, profile);
         if self.stopped.contains(&key) { return None; }
         if let Some(entry) = self.entries.get(&key) {
             match entry {
-                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
+                CachedResource::Bytes { bytes, .. } => return bytes.snapshot().ok(),
                 CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
                     return None;
                 }
@@ -851,7 +875,14 @@ impl RenderResourceCache {
                 if let (Some(intrinsic), Some(CachedResource::Bytes { intrinsic: cached, .. })) = (intrinsic, self.entries.get(&key)) {
                     let _ = cached.set(intrinsic);
                 }
-                Some(bytes)
+                self.entries.get(&key).and_then(|entry| match entry {
+                    CachedResource::Bytes { bytes, .. } => bytes.snapshot().ok(),
+                    _ => None,
+                }).or_else(|| {
+                    crate::parkable::ParkableBytes::unmanaged(bytes)
+                        .snapshot()
+                        .ok()
+                })
             }
             None => {
                 let generation = self.html_image_requests.get_mut().generation(&key);
@@ -862,10 +893,30 @@ impl RenderResourceCache {
         }
     }
 
+    /// Opportunistic parking sweep: the cache is `!Send` so no background
+    /// thread can reach it, and deadlines are only honored while the cache
+    /// is actively serving. Throttled to keep the resource path cheap.
+    fn park_due(&mut self) {
+        const PARK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_park_sweep) < PARK_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_park_sweep = now;
+        if self
+            .parkable
+            .next_parking_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.parkable.park_due();
+        }
+    }
+
     fn insert_bytes(&mut self, url: String, bytes: Arc<[u8]>) {
         if self.max_entries == 0 || bytes.len() > self.max_bytes {
             return;
         }
+        self.park_due();
         while self.entries.len() >= self.max_entries
             || self.retained_bytes.saturating_add(bytes.len()) > self.max_bytes
         {
@@ -877,7 +928,7 @@ impl RenderResourceCache {
         self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
         self.order.push_back(url.clone());
         self.entries.insert(url, CachedResource::Bytes {
-            bytes,
+            bytes: self.parkable.from_frozen_bytes(bytes),
             intrinsic: std::sync::OnceLock::new(),
             static_raster: std::sync::OnceLock::new(),
         });
@@ -922,12 +973,12 @@ impl RenderResourceCache {
     fn raster_paint(
         &mut self,
         resource_key: &str,
-        bytes: Arc<[u8]>,
+        bytes: &crate::parkable::ParkableBytesSnapshot,
         width: u32,
         height: u32,
     ) -> Option<Arc<Pixmap>> {
         if let Some(index) = self.raster_paints.iter().position(|entry| {
-            entry.resource_key == resource_key && Arc::ptr_eq(&entry.bytes, &bytes)
+            entry.resource_key == resource_key && entry.owner_id == bytes.owner_id()
                 && entry.raster.width() == width && entry.raster.height() == height
         }) {
             let entry = self.raster_paints.remove(index)?;
@@ -935,7 +986,7 @@ impl RenderResourceCache {
             self.raster_paints.push_back(entry);
             return Some(raster);
         }
-        let raster = Arc::new(raster_to_pixmap(&bytes, width, height)?);
+        let raster = Arc::new(raster_to_pixmap(bytes, width, height)?);
         let size = raster.data().len();
         // Cache only bytes still owned by this page's normal resource cache.
         // This excludes disabled/over-budget caches and ephemeral data URLs.
@@ -947,8 +998,8 @@ impl RenderResourceCache {
         // resource replacement drops it along with the original bytes.
         let cacheable = match self.entries.get(resource_key) {
             Some(CachedResource::Bytes { bytes: current, static_raster, .. })
-                if Arc::ptr_eq(current, &bytes) => {
-                    *static_raster.get_or_init(|| static_raster_cacheable(&bytes))
+                if current.id() == bytes.owner_id() => {
+                    *static_raster.get_or_init(|| static_raster_cacheable(bytes))
                 }
             _ => false,
         };
@@ -963,7 +1014,9 @@ impl RenderResourceCache {
         }
         self.raster_paint_bytes += size;
         self.raster_paints.push_back(CachedRasterPaint {
-            resource_key: resource_key.to_owned(), bytes, raster: Arc::clone(&raster),
+            resource_key: resource_key.to_owned(),
+            owner_id: bytes.owner_id(),
+            raster: Arc::clone(&raster),
         });
         Some(raster)
     }
@@ -8001,7 +8054,7 @@ fn fetch_bytes(
     src: &str,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> Option<Arc<[u8]>> {
+) -> Option<crate::parkable::ParkableBytesSnapshot> {
     fetch_bytes_with_kind(src, base_url, cache, false)
 }
 
@@ -8009,7 +8062,7 @@ fn fetch_font_bytes(
     src: &str,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
-) -> Option<Arc<[u8]>> {
+) -> Option<crate::parkable::ParkableBytesSnapshot> {
     fetch_bytes_with_kind(src, base_url, cache, true)
 }
 
@@ -8018,7 +8071,7 @@ fn fetch_bytes_with_kind(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
     is_font: bool,
-) -> Option<Arc<[u8]>> {
+) -> Option<crate::parkable::ParkableBytesSnapshot> {
     if let Some(rest) = src.strip_prefix("data:") {
         let comma_idx = rest.find(',')?;
         let (meta, data) = (&rest[..comma_idx], &rest[comma_idx + 1..]);
@@ -8031,7 +8084,9 @@ fn fetch_bytes_with_kind(
         } else {
             Some(percent_decode(data))
         }?;
-        return Some(Arc::from(bytes));
+        return crate::parkable::ParkableBytes::unmanaged(Arc::from(bytes.as_slice()))
+            .snapshot()
+            .ok();
     }
     let resolved = resolve_resource_url(src, base_url)?;
     cache.get_or_load(&resolved, is_font)
@@ -10797,7 +10852,7 @@ fn paint_image(
             None => network_resource_url(&url),
         });
         match key {
-            Some(key) => cache.raster_paint(&key, bytes, rw, rh),
+            Some(key) => cache.raster_paint(&key, &bytes, rw, rh),
             None => raster_to_pixmap(&bytes, rw, rh).map(Arc::new),
         }
     } else {
@@ -14715,9 +14770,10 @@ mod tests {
         // Layout/metadata preparation must not initialize paint eligibility.
         cache.entries.get(url).unwrap().image_intrinsic();
         assert_eq!(eligibility(&cache), None);
-        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        cache.raster_paint(url, &snapshot, 12, 18).unwrap();
         assert_eq!(eligibility(&cache), Some(true));
-        cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        cache.raster_paint(url, &snapshot, 6, 9).unwrap();
         assert_eq!(eligibility(&cache), Some(true));
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
         assert_eq!(eligibility(&cache), None);
@@ -14732,15 +14788,17 @@ mod tests {
         let bytes = raster_cache_fixture();
         let url = "https://example.test/image.png";
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
-        let first = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
-        let second = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        let first = cache.raster_paint(url, &snapshot, 12, 18).unwrap();
+        let second = cache.raster_paint(url, &snapshot, 12, 18).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.data(), raster_to_pixmap(&bytes, 12, 18).unwrap().data());
-        let resized = cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        let resized = cache.raster_paint(url, &snapshot, 6, 9).unwrap();
         assert!(!Arc::ptr_eq(&first, &resized));
         let cors_key = image_resource_key(url, ImageRequestProfile::CorsInclude);
         cache.seed_image_shared(url.to_owned(), ImageRequestProfile::CorsInclude, Arc::clone(&bytes));
-        let cors = cache.raster_paint(&cors_key, bytes, 12, 18).unwrap();
+        let cors_snapshot = cache.get_or_load_image(url, ImageRequestProfile::CorsInclude).unwrap();
+        let cors = cache.raster_paint(&cors_key, &cors_snapshot, 12, 18).unwrap();
         assert!(!Arc::ptr_eq(&first, &cors));
         assert_eq!(first.data(), cors.data());
     }
@@ -14751,15 +14809,18 @@ mod tests {
         let bytes = raster_cache_fixture();
         let url = "https://example.test/a.png";
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
-        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        cache.raster_paint(url, &snapshot, 12, 18).unwrap();
         assert!(cache.raster_paint_bytes > 0);
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
         assert_eq!(cache.raster_paint_bytes, 0);
-        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        cache.raster_paint(url, &snapshot, 12, 18).unwrap();
         cache.seed_missing(url.to_owned());
         assert!(cache.raster_paints.is_empty());
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
-        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        cache.raster_paint(url, &snapshot, 12, 18).unwrap();
         cache.seed_shared("https://example.test/b.png".to_owned(), bytes);
         assert!(cache.raster_paints.is_empty());
         assert_eq!(cache.raster_paint_bytes, 0);
@@ -14800,10 +14861,11 @@ mod tests {
         let mut cache = RenderResourceCache::default();
         let url = "https://example.test/animated.png";
         cache.seed_shared(url.to_owned(), Arc::clone(&animated));
-        assert!(cache.raster_paint(url, animated, 2, 3).is_some());
+        let snapshot = cache.get_or_load(url, false).unwrap();
+        assert!(cache.raster_paint(url, &snapshot, 2, 3).is_some());
         assert!(cache.raster_paints.is_empty());
-        let static_bytes = raster_cache_fixture();
-        assert!(cache.raster_paint("https://example.test/unretained.png", static_bytes, 2, 3).is_some());
+        let unretained = crate::parkable::ParkableBytes::unmanaged(raster_cache_fixture());
+        assert!(cache.raster_paint("https://example.test/unretained.png", &unretained.snapshot().unwrap(), 2, 3).is_some());
         assert!(cache.raster_paints.is_empty());
     }
 
@@ -14813,18 +14875,19 @@ mod tests {
         let bytes = raster_cache_fixture();
         let url = "https://example.test/image.png";
         cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        let snapshot = cache.get_or_load(url, false).unwrap();
         for width in 1..=80 {
-            cache.raster_paint(url, Arc::clone(&bytes), width, 1).unwrap();
+            cache.raster_paint(url, &snapshot, width, 1).unwrap();
             assert!(cache.raster_paints.len() <= RASTER_PAINT_CACHE_ENTRIES);
         }
         for width in 500..510 {
-            cache.raster_paint(url, Arc::clone(&bytes), width, 800).unwrap();
+            cache.raster_paint(url, &snapshot, width, 800).unwrap();
             assert!(cache.raster_paint_bytes <= RASTER_PAINT_CACHE_BYTES);
             assert_eq!(cache.raster_paint_bytes,
                 cache.raster_paints.iter().map(|entry| entry.raster.data().len()).sum::<usize>());
         }
         let before = cache.raster_paint_bytes;
-        cache.raster_paint(url, Arc::clone(&bytes), 1024, 1024).unwrap();
+        cache.raster_paint(url, &snapshot, 1024, 1024).unwrap();
         assert_eq!(cache.raster_paint_bytes, before);
         assert!(!static_raster_cacheable(b"GIF89a"));
         assert!(!static_raster_cacheable(b"<svg/>"));
