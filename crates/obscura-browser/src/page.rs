@@ -1260,7 +1260,7 @@ impl Page {
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                 return true;
             }
-            let realm = match self.js.as_mut().and_then(|js| {
+            let mut realm = match self.js.as_mut().and_then(|js| {
                 FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
             }) {
                 Some(realm) => realm,
@@ -1548,6 +1548,11 @@ impl Page {
         }
         // A frame's own children are in that frame's document, not the page's.
         for index in 0..self.frames.len() {
+            // A frame whose realm was never materialized cannot have children:
+            // child declarations only happen once script enters the frame.
+            if !self.frames[index].is_materialized() {
+                continue;
+            }
             let Some(js) = self.js.as_mut() else { return };
             match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
                 Ok(value) => {
@@ -1688,7 +1693,7 @@ impl Page {
         index: usize,
         expression: &str,
     ) -> Result<serde_json::Value, String> {
-        let realm = self.frames.get(index).ok_or("no such frame")?;
+        let realm = self.frames.get_mut(index).ok_or("no such frame")?;
         let js = self.js.as_mut().ok_or("no runtime")?;
         realm.evaluate(js, expression)
     }

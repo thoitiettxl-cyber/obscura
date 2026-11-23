@@ -32,18 +32,27 @@ use crate::runtime::ObscuraJsRuntime;
 /// One child browsing context: its own realm, document and origin, living in
 /// the page's isolate.
 pub struct FrameRealm {
-    context: deno_core::v8::Global<deno_core::v8::Context>,
+    /// `None` while the frame is declared but never reached by script: a
+    /// scriptless `about:blank` frame costs no V8 context. The first script
+    /// touch materializes the realm on demand.
+    context: Option<deno_core::v8::Global<deno_core::v8::Context>>,
     /// Held so the frame's entry can be taken out again when the frame dies.
     realms: Rc<std::cell::RefCell<RealmStates>>,
     frame_id: u32,
     parent_frame_id: u32,
     url: String,
     origin: String,
+    /// The document bytes to parse when the realm is materialized.
+    html: Option<String>,
+    /// Viewport to apply on materialization.
+    viewport: (f64, f64),
 }
 
 impl Drop for FrameRealm {
     fn drop(&mut self) {
-        self.realms.borrow_mut().forget(&self.context);
+        // forget_frame also releases the declare-time bookkeeping of a frame
+        // whose realm was never materialized.
+        self.realms.borrow_mut().forget_frame(self.frame_id);
     }
 }
 
@@ -66,20 +75,67 @@ impl FrameRealm {
             let state = realms.borrow().by_frame_id(frame_id)?;
             let origin = state.borrow().inherited_origin.clone().unwrap_or_else(|| origin_of(url));
             return Some(Self {
-                context,
+                context: Some(context),
                 realms,
                 frame_id,
                 parent_frame_id,
                 url: url.to_string(),
                 origin,
+                html: None,
+                viewport: (300.0, 150.0),
             });
         }
-        if realms.borrow().live_count() >= crate::ops::max_live_frames() {
-            return None;
+        let mut realm = Self {
+            context: None,
+            realms,
+            frame_id,
+            parent_frame_id,
+            url: url.to_string(),
+            origin: "null".to_string(),
+            html: Some(html.to_string()),
+            viewport: (300.0, 150.0),
+        };
+        // A scriptless about:blank frame keeps only its declared identity:
+        // the realm materializes when script first reaches into it.
+        if url == "about:blank" {
+            return Some(realm);
         }
-        let context = parent.create_realm_context()?;
+        if realm.materialize(parent) { Some(realm) } else { None }
+    }
+
+    /// Whether the frame's V8 realm exists yet.
+    pub fn is_materialized(&self) -> bool {
+        self.context.is_some()
+    }
+
+    /// Builds the frame's realm if it does not exist, either by adopting the
+    /// realm script created through `op_initial_frame` or by building one the
+    /// same way `new` does. Returns `false` when the frame cannot be built.
+    fn materialize(&mut self, parent: &mut ObscuraJsRuntime) -> bool {
+        if self.context.is_some() {
+            return true;
+        }
+        {
+            let realms = self.realms.borrow();
+            if let Some(context) = realms.context(self.frame_id) {
+                if let Some(state) = realms.by_frame_id(self.frame_id) {
+                    self.origin = state.borrow().inherited_origin.clone()
+                        .unwrap_or_else(|| origin_of(&self.url));
+                }
+                self.context = Some(context);
+                self.html = None;
+                return true;
+            }
+        }
+        if self.realms.borrow().live_count() >= crate::ops::max_live_frames() {
+            return false;
+        }
+        let html = self.html.take().unwrap_or_default();
+        let frame_id = self.frame_id;
+        let parent_frame_id = self.parent_frame_id;
+        let Some(context) = parent.create_realm_context() else { return false };
         if !parent.share_ops_with_realm(&context) {
-            return None;
+            return false;
         }
         parent.copy_identity_to_realm(&context);
         // A snapshot-created realm has null deno_core per-context state slots, so
@@ -91,12 +147,13 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let (scripting_enabled, sandbox_opaque_origin) = realms.borrow().by_frame_id(parent_frame_id)
+        let (scripting_enabled, sandbox_opaque_origin) = self.realms.borrow()
+            .by_frame_id(parent_frame_id)
             .map(|creator| {
                 let creator = creator.borrow();
                 (creator.scripting_enabled, creator.sandbox_opaque_origin)
             }).unwrap_or((true, false));
-        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(&self.url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -104,47 +161,44 @@ impl FrameRealm {
 
         let mut state = ObscuraState::new();
         state.navigation_timing.record("domLoading");
-        state.dom = Some(parse_html(html));
-        state.url = url.to_string();
+        state.dom = Some(parse_html(&html));
+        state.url = self.url.clone();
         state.frame_id = frame_id;
         state.parent_frame_id = parent_frame_id;
         state.scripting_enabled = scripting_enabled;
         state.sandbox_opaque_origin = sandbox_opaque_origin;
         if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
+        #[cfg(feature = "render")]
+        state.set_viewport(self.viewport.0, self.viewport.1);
         parent.share_resources_with(&mut state);
 
-        let realms = parent.realm_states();
-        realms.borrow_mut().register(
+        self.realms.borrow_mut().register(
             context.clone(),
             frame_id,
             Rc::new(std::cell::RefCell::new(state)),
         );
 
-        let realm = FrameRealm {
-            context,
-            realms,
-            frame_id,
-            parent_frame_id,
-            url: url.to_string(),
-            origin,
-        };
+        self.context = Some(context);
+        self.origin = origin;
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
         // top-level has already taken the wrong branch.
         let watchdog = parent.arm_watchdog(std::time::Duration::from_secs(5));
-        let initialized = realm.run(parent, &format!(
+        let initialized = self.run(parent, &format!(
             "globalThis.__obscura_frameId = {frame_id};\
              globalThis.__obscura_parentFrameId = {parent_frame_id};\
              globalThis.__obscura_init();"
         ));
         parent.disarm_watchdog(watchdog);
-        initialized.ok()?;
+        if initialized.is_err() {
+            return false;
+        }
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
-            parent.publish_realm_objects(&realm.context, frame_id);
+            parent.publish_realm_objects(self.context.as_ref().unwrap(), parent_frame_id, frame_id);
         }
-        Some(realm)
+        true
     }
 
     /// Fires the frame document's lifecycle events, in spec order.
@@ -154,7 +208,10 @@ impl FrameRealm {
     /// scripts defer until then. That is most of what a widget does: a frame
     /// can talk to its parent perfectly and still never build its interface,
     /// which looks like a rendering problem and is a lifecycle one.
-    pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+    pub fn dispatch_load_events(&mut self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+        if !self.materialize(parent) {
+            return Err("Frame realm could not be built".to_string());
+        }
         let state = self.realms.borrow().by_frame_id(self.frame_id)
             .ok_or_else(|| "Frame no longer exists".to_string())?;
         {
@@ -193,7 +250,7 @@ impl FrameRealm {
 
     /// Delivers a `postMessage` that another realm sent to this one.
     pub fn deliver_message(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         data_json: &str,
         origin: &str,
@@ -213,7 +270,7 @@ impl FrameRealm {
 
     /// Delivers a queued message without losing a retired sender's Window identity.
     pub fn deliver_queued_message(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         message: &crate::ops::PendingFrameMessage,
     ) -> Result<(), String> {
@@ -233,7 +290,7 @@ impl FrameRealm {
 
     /// Sets the frame document's viewport before any of its scripts run.
     pub fn set_viewport(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         width: f64,
         height: f64,
@@ -248,6 +305,12 @@ impl FrameRealm {
         } else {
             150.0
         };
+        if !self.is_materialized() {
+            // Stored for materialize(); a realm that never runs script never
+            // needs its viewport.
+            self.viewport = (width, height);
+            return Ok(());
+        }
         #[cfg(feature = "render")]
         {
             let state = self.realms.borrow().by_frame_id(self.frame_id)
@@ -288,13 +351,16 @@ impl FrameRealm {
 
     /// Runs `source` in the frame's realm. Ops called from it find the frame's
     /// document by looking up the realm they were called from.
-    fn run(&self, parent: &mut ObscuraJsRuntime, source: &str) -> Result<String, String> {
-        parent.eval_in_realm(&self.context, source)
+    fn run(&mut self, parent: &mut ObscuraJsRuntime, source: &str) -> Result<String, String> {
+        if !self.materialize(parent) {
+            return Err("Frame realm could not be built".to_string());
+        }
+        parent.eval_in_realm(self.context.as_ref().unwrap(), source)
     }
 
     /// Runs a script inside the frame, reporting a script error as `Err`.
     pub fn execute_script(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         source: &str,
     ) -> Result<(), String> {
@@ -303,7 +369,7 @@ impl FrameRealm {
 
     /// Evaluates an expression inside the frame and decodes it as JSON.
     pub fn evaluate(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         expression: &str,
     ) -> Result<serde_json::Value, String> {
@@ -323,7 +389,7 @@ impl FrameRealm {
     ///
     /// Returns one message per script that failed or was skipped.
     pub fn run_document_scripts(
-        &self,
+        &mut self,
         parent: &mut ObscuraJsRuntime,
         load_external: impl Fn(&str) -> Option<String>,
     ) -> Vec<String> {
@@ -368,6 +434,12 @@ impl FrameRealm {
     /// A caller that fetches over the network needs the list before running
     /// anything, because `run_document_scripts` resolves sources synchronously.
     pub fn external_script_urls(&self, _parent: &mut ObscuraJsRuntime) -> Vec<String> {
+        if self.context.is_none() {
+            // An unmaterialized frame has no parsed document to list from.
+            // Only about:blank frames defer, and a blank document has no
+            // scripts anyway.
+            return Vec::new();
+        }
         self.list_scripts()
             .unwrap_or_default()
             .iter()
@@ -471,7 +543,7 @@ mod tests {
     fn frame_shadow_root_append_uses_its_own_document() {
         let mut parent = page("https://parent.example/",
             "<html><body><div id='host'>Parent</div></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
             "<html><body><div id='host'>Child</div></body></html>").unwrap();
 
         let result = frame.evaluate(&mut parent, r#"(() => {
@@ -503,7 +575,7 @@ mod tests {
             document.getElementById('host').attachShadow({ mode: 'open' })
                 .innerHTML = '<span>parent shadow</span>';
         "#).unwrap();
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
             "<html><body><div id='host'>Child</div></body></html>").unwrap();
 
         let result = frame.evaluate(&mut parent,
@@ -513,6 +585,32 @@ mod tests {
         assert_eq!(parent.evaluate(
             "document.getElementById('host').shadowRoot.textContent").unwrap(),
             serde_json::json!("parent shadow"));
+    }
+
+    /// A same-origin remote-loaded frame gets the real `parent` and `top`,
+    /// not the cross-origin placeholders: page scripts inside it must be able
+    /// to read arbitrary parent properties without a SecurityError.
+    #[test]
+    fn same_origin_frame_reaches_real_parent_window() {
+        let mut parent = page("https://parent.example/",
+            "<html><body>Parent</body></html>");
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body>Child</body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            let reachable;
+            try { reachable = parent.__obscura_probe === undefined; }
+            catch (error) { return ["blocked", error.name]; }
+            return [
+                reachable,
+                parent === window,
+                parent === top,
+                parent.document === document,
+                top.document === document,
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result, serde_json::json!([true, false, true, false, false]));
     }
 
     #[test]
@@ -547,7 +645,7 @@ mod tests {
     fn frame_closed_shadow_root_stays_private_and_rejects_duplicate_attach() {
         let mut parent = page("https://parent.example/",
             "<html><body><div id='host'>Parent</div></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
             "<html><body><div id='host'>Child</div></body></html>").unwrap();
 
         let result = frame.evaluate(&mut parent, r#"(() => {
@@ -589,7 +687,7 @@ mod tests {
     fn html_interface_brands_stay_in_the_creation_realm() {
         let mut parent = page("https://parent.example/",
             "<html><body><div id='parent'>Parent</div></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
             "<html><body><div id='child'>Child</div><span></span></body></html>").unwrap();
         assert_eq!(frame.evaluate(&mut parent, r#"(() => {
             HTMLDivElement.prototype.__brandProbe = 'child';
@@ -678,7 +776,7 @@ mod tests {
         crate::set_v8_flags("--stress-compaction --stress-marking=1");
         for _ in 0..10 {
             let mut parent = page("https://parent.example/page", "<html><body>Parent</body></html>");
-            let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
                 "<html><body>Child</body></html>").expect("frame realm");
             assert_eq!(frame.evaluate(&mut parent, "document.body.textContent").unwrap(),
                 serde_json::json!("Child"));
@@ -697,7 +795,7 @@ mod tests {
             .execute_script("p", "globalThis.marker = 'parent';")
             .unwrap();
 
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -754,7 +852,7 @@ mod tests {
             initialWindowProbe.eval('globalThis.marker = 42; document.body.textContent = "child"');
         "#).unwrap();
         let pending = parent.take_pending_frames().pop().expect("initial frame queued");
-        let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
+        let mut frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
             &pending.url, &pending.html).expect("adopt initial realm");
         assert_eq!(frame.origin(), "https://parent.example");
         assert_eq!(frame.evaluate(&mut parent,
@@ -775,7 +873,7 @@ mod tests {
             initialWindowProbe.postMessage('from-parent', '*');
         "#).unwrap();
         let pending = parent.take_pending_frames().pop().unwrap();
-        let frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
+        let mut frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
             &pending.url, &pending.html).unwrap();
         frame.execute_script(&mut parent,
             "parent.postMessage('from-child', '*'); postMessage('to-self', '*');").unwrap();
@@ -890,7 +988,7 @@ mod tests {
             "https://parent.example/page",
             "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
         );
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -916,7 +1014,7 @@ mod tests {
     fn frame_renderer_viewport_changes_do_not_resize_the_page() {
         let mut parent = page("https://parent.example/",
             "<html><head><style>body{margin:0}#page{width:100vw;height:100vh}</style></head><body><div id='page'></div></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
             "<html><head><style>body{margin:0}div{width:50vw;height:25vh}</style></head><body><div id='box'></div></body></html>").unwrap();
         frame.set_viewport(&mut parent, 300.0, 80.0).unwrap();
         assert_eq!(frame.evaluate(&mut parent, r#"(() => {
@@ -949,7 +1047,7 @@ mod tests {
         parent.set_url("https://parent.example/");
         parent.run_page_init();
 
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -983,7 +1081,7 @@ mod tests {
         {
             let src = if external { "src=/script.js" } else { "" };
             let end = if complete { "</script>" } else { "" };
-            let frame = FrameRealm::new(&mut parent, index as u32 + 1, 0,
+            let mut frame = FrameRealm::new(&mut parent, index as u32 + 1, 0,
                 "https://child.example/", &format!("<body><script {src}>window.runs=1;{end}"))
                 .expect("frame realm");
             let expected_urls = if external && complete { vec!["https://child.example/script.js"] } else { vec![] };
@@ -1004,7 +1102,7 @@ mod tests {
     #[test]
     fn frame_runs_its_document_scripts_in_order() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1055,7 +1153,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frame_posted_task_runs_in_its_creation_realm() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1096,7 +1194,7 @@ mod tests {
             "https://parent.example/",
             "<html><body data-owner='parent'></body></html>",
         );
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1173,7 +1271,7 @@ mod tests {
     #[test]
     fn frame_navigation_timing_records_its_own_event_boundaries() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
             "<html><body></body></html>").unwrap();
         frame.execute_script(&mut parent, r#"
             globalThis.samples = [];
@@ -1199,7 +1297,7 @@ mod tests {
     #[test]
     fn frame_navigation_timing_terminated_load_does_not_record_completion() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
             "<html><body></body></html>").unwrap();
         frame.execute_script(&mut parent,
             "window.addEventListener('load',()=>{globalThis.entered=true;while(true){}});").unwrap();
@@ -1214,7 +1312,7 @@ mod tests {
     #[test]
     fn frame_body_onload_content_attribute_reflects_to_window() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1251,7 +1349,7 @@ mod tests {
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1284,7 +1382,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn many_frames_can_be_alive_at_once() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frames: Vec<FrameRealm> = (0..4)
+        let mut frames: Vec<FrameRealm> = (0..4)
             .map(|index| {
                 FrameRealm::new(
                     &mut parent,
@@ -1299,13 +1397,13 @@ mod tests {
             })
             .collect();
 
-        for (index, frame) in frames.iter().enumerate() {
+        for (index, frame) in frames.iter_mut().enumerate() {
             frame
                 .execute_script(&mut parent, &format!("globalThis.n = {index};"))
                 .unwrap();
         }
         // Out-of-order access must be safe: each frame carries its own state.
-        for (index, frame) in frames.iter().enumerate().rev() {
+        for (index, frame) in frames.iter_mut().enumerate().rev() {
             assert_eq!(
                 frame.evaluate(&mut parent, "globalThis.n").unwrap().as_f64(),
                 Some(index as f64)
@@ -1326,7 +1424,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_frames_deferred_work_still_sees_the_frames_document() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1369,7 +1467,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_frame_timer_fires_without_deno_cores_timer_queue() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1393,7 +1491,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clear_timeout_cancels_a_frame_timer() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1423,7 +1521,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_frames_promise_continuation_sees_the_frames_document() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1454,7 +1552,7 @@ mod tests {
     #[test]
     fn a_frame_rejection_does_not_crash_the_process() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1471,7 +1569,7 @@ mod tests {
     #[test]
     fn a_frame_dynamic_import_does_not_crash_the_process() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1502,7 +1600,7 @@ mod tests {
                    [e.data, e.origin, e.isTrusted]));",
             )
             .unwrap();
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1547,7 +1645,7 @@ mod tests {
                  addEventListener('message', (e) => globalThis.got.push([e.data, e.origin]));",
             )
             .unwrap();
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1611,7 +1709,7 @@ mod tests {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
 
         // A loaded, same-origin child frame.
-        let child = FrameRealm::new(
+        let mut child = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1648,7 +1746,7 @@ mod tests {
 
         // An opaque (about:blank) frame: the wildcard must still deliver, so the
         // common widget case never breaks even when the frame origin is 'null'.
-        let blank = FrameRealm::new(
+        let mut blank = FrameRealm::new(
             &mut parent,
             2,
             0,
@@ -1678,7 +1776,7 @@ mod tests {
     #[test]
     fn a_framed_realm_does_not_look_top_level() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             2,
             0,
@@ -1706,7 +1804,7 @@ mod tests {
     fn a_flood_of_messages_cannot_grow_the_queue_without_bound() {
         std::env::set_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES", "64");
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1742,7 +1840,7 @@ mod tests {
     fn a_discarded_realm_leaves_the_page_safe_to_run() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         {
-            let frame = FrameRealm::new(
+            let mut frame = FrameRealm::new(
                 &mut parent,
                 1,
                 0,
@@ -1799,7 +1897,7 @@ mod tests {
             "https://parent.example/",
             "<html><head><title>parent</title></head><body></body></html>",
         );
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1837,7 +1935,7 @@ mod tests {
     #[test]
     fn a_cross_origin_frame_is_not_reachable_from_the_page() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(
+        let mut frame = FrameRealm::new(
             &mut parent,
             1,
             0,
@@ -1866,7 +1964,7 @@ mod tests {
     #[test]
     fn remote_dom_nodes_preserve_foreign_document_identity_and_reject_stale_frames() {
         let mut parent = page("https://example.com/", "<div id=parent>parent</div>");
-        let frame = FrameRealm::new(&mut parent, 1, 0, "https://example.com/child",
+        let mut frame = FrameRealm::new(&mut parent, 1, 0, "https://example.com/child",
             "<base href='/assets/'><span id=child>child</span>").unwrap();
         let info = parent.store_object_with_meta(
             "globalThis.__obscura_frameObjects[1].document.getElementById('child')").unwrap();
@@ -1998,14 +2096,14 @@ mod tests {
             </body></html>",
         );
         parent.evaluate_script("__obscura_init_frames();").unwrap();
-        let frame_a = FrameRealm::new(
+        let mut frame_a = FrameRealm::new(
             &mut parent,
             1,
             0,
             "https://other.example/a",
             "<html><body></body></html>",
         ).unwrap();
-        let frame_b = FrameRealm::new(
+        let mut frame_b = FrameRealm::new(
             &mut parent,
             2,
             0,
@@ -2050,7 +2148,7 @@ mod tests {
         assert!(parent.take_pending_frame_messages().is_empty(),
             "an unowned realm must not receive a pending owner's message");
 
-        let frame_c = FrameRealm::new(
+        let mut frame_c = FrameRealm::new(
             &mut parent,
             3,
             1,

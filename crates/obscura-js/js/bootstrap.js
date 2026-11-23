@@ -110,6 +110,25 @@ const __obscuraCore = globalThis.Deno.core;
   }
 })();
 
+// Error stacks must look like a native browser's: platform functions
+// implemented here as JS would otherwise leak `<obscura:*>` frames, which real
+// Chrome never reports (native bindings produce no JS frame). V8 routes every
+// .stack read through Error.prepareStackTrace; dropping the shim frames makes
+// error output match Chrome. Tradeoff: prepareStackTrace is a function where
+// Chrome has undefined, but a stack leak is certain detection while a custom
+// PST is also used by legitimate sites.
+Error.prepareStackTrace = function _obscuraStackFilter(error, frames) {
+  var out = String(error) + '\n';
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var file = '';
+    try { file = f.getFileName() || ''; } catch (_e) {}
+    if (file.indexOf('obscura') !== -1) continue;
+    out += '    at ' + f.toString() + '\n';
+  }
+  return out.slice(0, -1);
+};
+
 // Handoff for child frame realms. deno_core binds ops into the main context
 // only, so a realm restored from the snapshot arrives with its own empty
 // private core reference. The host reads this to take the main realm's bound op table
@@ -253,29 +272,69 @@ _nativeFnAdd(_functionToString);
     return _cache;
   }
   function _isGlobal(t) { return t === globalThis; }
+  // DOM wrappers and their prototypes: real Chrome exposes no `_`-prefixed
+  // member on them, so the engine's internals are filtered out of the same
+  // reflection APIs when they target anything on the Node chain. `Node` is
+  // resolved lazily (this block runs before its class declaration).
+  function _isDom(t) {
+    if (!t || (typeof t !== 'object' && typeof t !== 'function') || _isGlobal(t)) { return false; }
+    try { return t instanceof Node; } catch (e) { return false; }
+  }
+  function _hiddenName(name) { return typeof name === 'string' && name.charCodeAt(0) === 95; }
   function _filter(t, names) {
-    if (!_isGlobal(t)) { return names; }
-    var set = _set();
-    if (!set) { return names; }
+    var set = _isGlobal(t) ? _set() : null;
+    if (_isGlobal(t) && !set) { return names; }
+    var dom = !_isGlobal(t) && _isDom(t);
+    if (!set && !dom) { return names; }
     var out = [];
-    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    for (var i = 0; i < names.length; i++) {
+      var n = names[i];
+      if ((set && set.has(n)) || (dom && _hiddenName(n))) { continue; }
+      out.push(n);
+    }
     return out;
   }
   var _oGOPN = Object.getOwnPropertyNames;
   var _oOwnKeys = Reflect.ownKeys;
   var _oKeys = Object.keys;
   var _oGOPDs = Object.getOwnPropertyDescriptors;
+  var _oGOPD = Object.getOwnPropertyDescriptor;
+  var _oEntries = Object.entries;
+  var _oValues = Object.values;
   function define(obj, prop, impl) {
     try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
   define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
   define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
   define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  define(Object, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, p) {
+    var d = _oGOPD(t, p);
+    if (d && _isDom(t) && _hiddenName(p)) { return undefined; }
+    if (d && _isGlobal(t)) { var set = _set(); if (set && set.has(p)) { return undefined; } }
+    return d;
+  });
+  define(Object, 'entries', function entries(t) {
+    var all = _oEntries(t);
+    if (_isDom(t)) { return all.filter(function (e) { return !_hiddenName(e[0]); }); }
+    return all;
+  });
+  define(Object, 'values', function values(t) {
+    var all = _oValues(t);
+    if (_isDom(t)) {
+      var ks = _oKeys(t);
+      var out = [];
+      for (var i = 0; i < all.length; i++) { if (!_hiddenName(ks[i])) { out.push(all[i]); } }
+      return out;
+    }
+    return all;
+  });
   define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    } else if (_isDom(t)) {
+      var ks2 = _oGOPN(all); for (var j = 0; j < ks2.length; j++) { if (_hiddenName(ks2[j])) { delete all[ks2[j]]; } }
     }
     return all;
   });
@@ -780,7 +839,7 @@ const _getFp = (function _getFp() {
   cfp += '==';
   _fpCache = {
     gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
-    audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
+    audioBaseLatency: 0.011609977324263039,
     audioSampleRate: [44100, 48000][Math.floor(_fpRand(101) * 2)],
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
     compKnee: 30 + (_fpRand(103) - 0.5) * 4,
@@ -2024,7 +2083,16 @@ function _eventTargetRemove(target, type, callback, options) {
   if (byType.size === 0) _eventTargetListeners.delete(target);
   _eventTargetListenerChanged.get(target)?.();
 }
+// Real input gestures grant user activation; a scripted event of the same
+// types is indistinguishable at this layer, so any dispatched activation
+// gesture marks it, matching the state Botguard observes after a real click.
+const __obscura_ua = { ever: false };
+const __obscura_ua_types = new Set([
+  'click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart',
+  'keydown', 'keypress', 'input', 'submit',
+]);
 function _eventTargetDispatch(target, event, authorDispatch = false) {
+  if (event && __obscura_ua_types.has(event.type)) __obscura_ua.ever = true;
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
@@ -2495,31 +2563,42 @@ function __prepareInsertedSubtree(root) {
       else {
         const src = script.getAttribute('src');
         if (src && src !== 'about:blank') script._loadIframeSrc(src);
-        else if (_ensureInitialFrameRealm(script)) script.dispatchEvent(new Event('load'));
+        else {
+          // Declare only: a scriptless about:blank frame pays a V8 realm
+          // restore for nothing. contentWindow, contentDocument, and window[i]
+          // materialize the realm on first access; the element's own load
+          // event still fires on schedule.
+          _declareInitialFrame(script);
+          script.dispatchEvent(new Event('load'));
+        }
       }
     } else __prepareInsertedScript(script);
   }
 }
 
+// An enumerable own prop is visible to `for..in` and spread; keep the engine's
+// bookkeeping on nodes non-enumerable.
+function _hiddenOwn(node, name, value) { node[name] = value; }
+
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
-  node._treeParent = null;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeDetachedExact', true);
+  _hiddenOwn(node, '_treeParent', null);
+  _hiddenOwn(node, '_treeParentEpoch', _treeMutationEpoch);
+  _hiddenOwn(node, '_treeConnected', false);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
-  node._treeParent = parent;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeDetachedExact', false);
+  _hiddenOwn(node, '_treeParent', parent);
+  _hiddenOwn(node, '_treeParentEpoch', _treeMutationEpoch);
+  _hiddenOwn(node, '_treeConnected', !!connected);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedUnchangedConnection(node, connected) {
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _hiddenOwn(node, '_treeConnected', !!connected);
+  _hiddenOwn(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 // Node documents. The main document owns a node unless its tree's root says
@@ -2917,6 +2996,25 @@ function _attributePositionKey(node) {
   return _attributePositionOrder.get(node);
 }
 
+// Kept for internal structuredClone after the global is hidden from pages
+// (Chrome gates SharedArrayBuffer on crossOriginIsolated). The V8 snapshot
+// does not expose the ctor, so it is captured per realm in __obscura_init.
+let _SharedArrayBuffer;
+
+class EventTarget {
+  addEventListener(type, callback, options) {
+    _eventTargetAdd(this, type, callback, options);
+  }
+  removeEventListener(type, callback, options) {
+    _eventTargetRemove(this, type, callback, options);
+  }
+  dispatchEvent(event) {
+    return _eventTargetDispatch(this, event, true);
+  }
+}
+
+// NOTE: no `extends EventTarget` here -- a derived ctor would run super() per
+// DOM node on the hot wrapping path. The chain is attached once below.
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -2937,7 +3035,10 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) {
+    // Own props show up under getOwnPropertyNames; real elements have none.
+    this._nid = nid;
+  }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return _nodeDocumentOf(this); }
@@ -3156,8 +3257,8 @@ class Node {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
     const connected = _dom("is_connected", this._nid) === "true";
-    this._treeConnected = connected;
-    this._treeConnectedEpoch = _treeMutationEpoch;
+    _hiddenOwn(this, '_treeConnected', connected);
+    _hiddenOwn(this, '_treeConnectedEpoch', _treeMutationEpoch);
     return connected;
   }
   normalize() {
@@ -3444,7 +3545,7 @@ let __docIsUtf8;
 function _docEncoding() {
   if (__docEncoding === undefined) {
     const e = _domParse("document_encoding");
-    __docEncoding = (typeof e === 'string' && e) ? e : 'UTF-8';
+    __docEncoding = (typeof e === 'string' && e) ? e : 'windows-1252';
     __docIsUtf8 = __docEncoding.toLowerCase() === 'utf-8';
   }
   return __docEncoding;
@@ -3565,6 +3666,8 @@ function _inputFormatNumber(type, n) {
   }
   return String(n);
 }
+
+Object.setPrototypeOf(Node.prototype, EventTarget.prototype);
 
 // WebIDL interface constants live on both the interface object and the interface
 // prototype object (instances inherit; idlharness checks Node.prototype).
@@ -4441,8 +4544,35 @@ class Element extends Node {
   }
   get style() { return _elementStyle(this); }
   set style(v) { if (typeof v === "string") _elementStyle(this).cssText = v; }
+  get nonce() {
+    if (this._nonceValue !== undefined) return this._nonceValue;
+    if (this._nullNamespaceAttrs instanceof Map) {
+      return this._nullNamespaceAttrs.get('nonce') || '';
+    }
+    return _domParse("get_attribute", this._nid, "nonce") || '';
+  }
+  set nonce(v) {
+    const value = `${v}`;
+    _hiddenOwn(this, '_nonceValue', value);
+    if (this._nullNamespaceAttrs instanceof Map) {
+      this._nullNamespaceAttrs.set('nonce', value);
+      return;
+    }
+    _dom("set_attribute", this._nid, "nonce", value);
+  }
+  get autocapitalize() { return this.getAttribute('autocapitalize') ?? ''; }
+  set autocapitalize(v) { this.setAttribute('autocapitalize', `${v}`); }
   getAttribute(n) {
     n = _htmlAttrName(this, n);
+    // The nonce attribute is hidden from getAttribute by spec: present reads
+    // back as the empty string, and its value is only reachable through the
+    // .nonce IDL attribute.
+    if (n === 'nonce') {
+      const present = this._nullNamespaceAttrs instanceof Map
+        ? this._nullNamespaceAttrs.has(n)
+        : _domParse("get_attribute", this._nid, n) !== null;
+      return present ? '' : null;
+    }
     // Script-created elements start with a provably empty attribute set. Keep
     // that small null-namespace map coherent through the ordinary mutation
     // APIs so React's write-then-read reflection does not cross the bridge.
@@ -5347,7 +5477,7 @@ class Element extends Node {
   _loadIframeSrc(url, submission) {
     _connectFrameContext(this);
     if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
-    if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _ensureInitialFrameRealm(this); return; }
+    if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _declareInitialFrame(this); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -5433,7 +5563,13 @@ class Element extends Node {
       this._iframeSrcdocTaskPending = false;
       if (!this.isConnected || this._iframeLoadingUrl !== 'about:srcdoc' || !this.hasAttribute('srcdoc')) return;
       if (this._frameId) globalThis.__obscura_forgetFrame(this._frameId);
+      // The initial blank realm may have materialized on an early
+      // contentDocument read; clear the whole declared state so the srcdoc
+      // navigation builds its own realm instead of keeping the blank one.
       this._frameId = 0;
+      this._frameDeclared = false;
+      this._iframeRealm = false;
+      this._iframeOpaque = false;
       _ensureInitialFrameRealm(this, this._iframeSrcdoc);
       this._iframeLoadedUrl = 'about:srcdoc';
     }, _schedulerPriorityRank['user-visible'] * 2, _browserPostedTaskGeneration(), () => {
@@ -7836,7 +7972,21 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
-  canPlayType(_type) { return ''; }
+  canPlayType(type) {
+    // Desktop Chrome media support: known containers answer 'maybe' without
+    // codecs and 'probably' with a codec we claim to decode.
+    const m = /^\s*(video|audio)\/([\w.-]+)\s*(?:;\s*codecs\s*=\s*"([^"]+)")?\s*$/i.exec(String(type));
+    if (!m) return '';
+    const kind = m[1].toLowerCase(), container = m[2].toLowerCase(), codecs = m[3];
+    const containers = kind === 'video'
+      ? new Set(['mp4', 'webm', 'ogg', 'x-matroska', 'quicktime'])
+      : new Set(['mpeg', 'mp3', 'mp4', 'aac', 'x-m4a', 'ogg', 'wav', 'wave', 'x-wav', 'webm', 'flac', 'x-flac', 'opus']);
+    if (!containers.has(container)) return '';
+    if (!codecs) return 'maybe';
+    const supported = /^(avc1|avc3|h264|vp8|vp9|vp09|av01|theora|mp4v|hev1|hvc1|mp4a|mp3|vorbis|opus|flac|fLaC|pcm|1$|alac)/i;
+    const list = codecs.split(',').map(c => c.trim());
+    return list.every(c => supported.test(c)) ? 'probably' : '';
+  }
   load() {}
   play() {
     return Promise.reject(new DOMException(
@@ -8315,7 +8465,11 @@ function _isWindowReflectingBodyElement(element) {
   return (name === 'body' || name === 'frameset') && element === _windowReflectingBodyElement();
 }
 
-globalThis.Window = globalThis.Window || function Window() {};
+globalThis.Window = globalThis.Window || class Window {};
+// Chrome's window chain has a WindowProperties hop between Window.prototype
+// and EventTarget.prototype; probes count the links.
+const _windowProperties = Object.create(EventTarget.prototype);
+Object.setPrototypeOf(globalThis.Window.prototype, _windowProperties);
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
@@ -8342,16 +8496,29 @@ Object.defineProperty(globalThis, 'length', {
   enumerable: true
 });
 
-// Since we cannot define a Proxy on globalThis easily, we'll define a reasonable number of indexed getters.
-for (let i = 0; i < 50; i++) {
-  Object.defineProperty(globalThis, i, {
-    get() {
-      const id = __obscuraCore.ops.op_frame_relation(_realmContextId, 2, i, '');
-      return id < 0 ? undefined : _windowForContext(id);
-    },
-    configurable: true,
-    enumerable: false
-  });
+// Chrome exposes window[i] only while child frame i exists, so the indexed
+// properties track the live frame count instead of a fixed table. Since a
+// Proxy cannot be attached to globalThis, indices 0..49 are re-synced
+// whenever the frame set changes.
+function _windowIndexValue(i) {
+  const id = __obscuraCore.ops.op_frame_relation(_realmContextId, 2, i, '');
+  return id < 0 ? undefined : _windowForContext(id);
+}
+function _syncWindowIndices() {
+  const count = __obscuraCore.ops.op_frame_relation(_realmContextId, 0, 0, '');
+  for (let i = 0; i < 50; i++) {
+    const key = String(i);
+    const has = Object.prototype.hasOwnProperty.call(globalThis, key);
+    if (i < count && !has) {
+      Object.defineProperty(globalThis, key, {
+        get() { return _windowIndexValue(i); },
+        configurable: true,
+        enumerable: true
+      });
+    } else if (i >= count && has) {
+      delete globalThis[key];
+    }
+  }
 }
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
@@ -8442,7 +8609,8 @@ class NetworkInformation {
   get effectiveType() { return '4g'; }
   get rtt() { return 50; }
   get saveData() { return false; }
-  get type() { return 'wifi'; }
+  // NetworkInformation.type was removed from Chrome (it never shipped a
+  // stable value); a present 'wifi' is an anachronism tell.
   get onchange() { return this._onchange || null; }
   set onchange(v) { this._onchange = typeof v === "function" ? v : null; }
   get ontypechange() { return this._ontypechange || null; }
@@ -8505,10 +8673,62 @@ function _uaBrands() {
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
-  vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
+  vendor: "Google Inc.", vendorSub: "", product: "Gecko", productSub: "20030107",
+  appCodeName: "Mozilla", appName: "Netscape",
   doNotTrack: null,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
+  credentials: {
+    create() { return Promise.resolve(null); },
+    get() { return Promise.resolve(null); },
+    preventSilentAccess() { return Promise.resolve(); },
+    store() { return Promise.resolve(); },
+  },
+  locks: {
+    request() { return Promise.reject(new DOMException('The operation is insecure', 'SecurityError')); },
+    query() { return Promise.resolve({ held: [], pending: [] }); },
+  },
+  mediaSession: {
+    metadata: null, playbackState: 'none',
+    setActionHandler() {}, setCameraActive() {}, setMicrophoneActive() {}, setPositionState() {},
+  },
+  wakeLock: { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } },
+  keyboard: { getLayoutMap() { return Promise.resolve(new Map()); }, lock() { return Promise.resolve(); }, unlock() {} },
+  mediaCapabilities: {
+    decodingInfo() { return Promise.resolve({ supported: false, smooth: false, powerEfficient: false }); },
+    encodingInfo() { return Promise.resolve({ supported: false, smooth: false, powerEfficient: false }); },
+  },
+  xr: { isSessionSupported() { return Promise.resolve(false); }, addEventListener() {}, removeEventListener() {}, dispatchEvent(event) { _demoteAuthorEvent(event); return true; } },
+  gpu: { requestAdapter() { return Promise.resolve(null); }, getPreferredCanvasFormat() { return 'bgra8unorm'; } },
+  hid: { getDevices() { return Promise.resolve([]); }, requestDevice() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); }, addEventListener() {}, removeEventListener() {} },
+  serial: { getPorts() { return Promise.resolve([]); }, requestPort() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); }, addEventListener() {}, removeEventListener() {}, onconnect: null, ondisconnect: null },
+  usb: { getDevices() { return Promise.resolve([]); }, requestDevice() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); }, addEventListener() {}, removeEventListener() {}, onconnect: null, ondisconnect: null },
+  devicePosture: { type: 'continuous', onchange: null, addEventListener() {}, removeEventListener() {} },
+  virtualKeyboard: { overlaysContent: false, show() {}, hide() {}, ongeometrychange: null, addEventListener() {}, removeEventListener() {} },
+  windowControlsOverlay: { visible: false, getTitlebarAreaRect() { return { x: 0, y: 0, width: 0, height: 0 }; }, ongeometrychange: null, addEventListener() {}, removeEventListener() {} },
+  userActivation: {
+    get isActive() { return __obscura_ua.ever; },
+    get hasBeenActive() { return __obscura_ua.ever; },
+  },
+  storageBuckets: { open() { return Promise.resolve({}); }, delete() { return Promise.resolve(); }, keys() { return Promise.resolve([]); } },
+  scheduling: { isInputPending() { return false; } },
+  ink: { requestPresenter() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } },
+  login: { setStatus() { return Promise.resolve(); } },
+  managed: { onmanagedconfigurationchange: null, addEventListener() {}, removeEventListener() {} },
+  presentation: { defaultRequest: null, receiver: null },
+  protectedAudience: { queryFeatureSupport() { return false; }, runAdAuction() { return Promise.resolve(null); }, createAuctionNonce() { return ''; } },
+  vibrate() { return true; },
+  registerProtocolHandler() {}, unregisterProtocolHandler() {},
+  requestMIDIAccess() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); },
+  requestMediaKeySystemAccess() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); },
+  getUserMedia() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); },
+  webkitGetUserMedia() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); },
+  setAppBadge() { return Promise.resolve(); }, clearAppBadge() { return Promise.resolve(); },
+  getInstalledRelatedApps() { return Promise.resolve([]); },
+  joinAdInterestGroup() { return Promise.resolve(); }, leaveAdInterestGroup() { return Promise.resolve(); }, updateAdInterestGroups() {},
+  runAdAuction() { return Promise.resolve(null); },
+  canLoadAdAuctionFencedFrame() { return false; }, createAuctionNonce() { return ''; },
+  deprecatedReplaceInURN() { return Promise.resolve(); }, deprecatedRunAdAuctionEnforcesKAnonymity() { return false; }, deprecatedURNToURL() { return Promise.resolve(''); }, getInterestGroupAdAuctionData() { return null; },
   userAgentData: {
     mobile: false,
     get brands() { return _uaBrands(); },
@@ -8520,6 +8740,7 @@ globalThis.navigator = {
         bitness: "64",
         brands: brands,
         fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+        formFactors: ["Desktop"],
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
@@ -8588,6 +8809,15 @@ globalThis.navigator = {
     },
     clearWatch() {},
   },
+  adAuctionComponents: {},
+  webkitPersistentStorage: {
+    requestQuota(_size, success, _error) { if (typeof success === 'function') success(0); },
+    queryUsageAndQuota(callback) { if (typeof callback === 'function') callback(0, 10737418240); },
+  },
+  webkitTemporaryStorage: {
+    requestQuota(_size, success, _error) { if (typeof success === 'function') success(0); },
+    queryUsageAndQuota(callback) { if (typeof callback === 'function') callback(0, 10737418240); },
+  },
   storage: {
     estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
@@ -8595,11 +8825,14 @@ globalThis.navigator = {
   },
 };
 
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
-// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
+// Put spoofed navigator props on Navigator.prototype itself so the instance
+// owns nothing and the proto chain is navigator -> Navigator.prototype ->
+// Object.prototype, matching Chrome. An intermediate prototype would leave a
+// phantom "Navigator" hop in the constructor chain.
 // Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
+  var _navProto = Navigator.prototype;
+  Object.defineProperty(_navProto, Symbol.toStringTag, { value: 'Navigator', configurable: true });
 
   function defGetter(key, fn) {
     _markNative(fn);
@@ -8653,6 +8886,22 @@ globalThis.navigator = {
   });
   _navProto.canShare = _markNative(function canShare() { return false; });
 
+  // Chrome keeps every navigator member on the prototype; the instance itself
+  // owns nothing. Hoist the literal's own props onto _navProto so
+  // hasOwnProperty/getOwnPropertyNames on the instance match.
+  var _nav = globalThis.navigator;
+  var _navOwn = Object.keys(_nav);
+  for (var _ni = 0; _ni < _navOwn.length; _ni++) {
+    var _nk = _navOwn[_ni];
+    var _nd = Object.getOwnPropertyDescriptor(_nav, _nk);
+    if (!_nd) continue;
+    try {
+      delete _nav[_nk];
+      if (typeof _nd.value === 'function') _markNative(_nd.value);
+      Object.defineProperty(_navProto, _nk, _nd);
+    } catch (_e) {}
+  }
+
   Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
@@ -8682,6 +8931,8 @@ globalThis.chrome = {
       wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
     };
   },
+  setClientEncryptionKeys() {},
+  setSyncEncryptionKeys() {},
 };
 
 globalThis.Notification = class Notification {
@@ -8699,7 +8950,8 @@ class Screen {
     this._availW = availW === undefined ? w : availW;
     this._availH = availH === undefined ? h - 40 : availH;
     this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(event){_demoteAuthorEvent(event);return true;}};
+    this.isExtended = false;
+    this.orientation = _mkScreenOrientation();
   }
   get width() { return this._w; }
   get height() { return this._h; }
@@ -8711,6 +8963,8 @@ class Screen {
   if (d && d.get) _markNative(d.get);
 });
 globalThis.Screen = Screen;
+// Screen inherits EventTarget in Chrome (orientationchange targets it).
+Object.setPrototypeOf(Screen.prototype, EventTarget.prototype);
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
   if (globalThis.screen instanceof Screen) {
@@ -9039,7 +9293,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   }
   return response;
 });
-globalThis.fetch = (input, init = {}) => _fetch(input, init);
+globalThis.fetch = function fetch(input, init = {}) { return _fetch(input, init); };
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
@@ -10206,9 +10460,98 @@ function _evaluateMediaFeature(raw) {
   match = feature.match(/^(hover|any-hover)\s*:\s*(none|hover)$/);
   if (match) return match[2] === 'hover';
 
-  if (feature === 'color') return true;
-  match = feature.match(/^color\s*:\s*(\d+)$/);
-  if (match) return Number(match[1]) === 8;
+  match = feature.match(/^(min-|max-)?([a-z][a-z0-9-]*)\s*(?::\s*(.+))?$/);
+  if (!match) return false;
+  return _evaluateMediaFeatureValue(match[1] || '', match[2],
+    match[3] === undefined ? null : match[3].trim());
+}
+
+// Media Queries Level 4/5 feature values for the desktop profile. Enum
+// features compare exactly; range prefixes only apply to numeric features.
+const _mediaEnumFeatures = {
+  'scripting': 'enabled',
+  // 'scan' only applies to tv media; on screen it matches nothing.
+  'scan': Symbol('no-scan'),
+  'update': 'fast',
+  'display-mode': 'browser',
+  'overflow-block': 'scroll',
+  'overflow-inline': 'scroll',
+  'color-gamut': 'srgb',
+  'video-color-gamut': 'srgb',
+  'dynamic-range': 'standard',
+  'video-dynamic-range': 'standard',
+  'prefers-contrast': 'no-preference',
+  'prefers-reduced-data': 'no-preference',
+  'prefers-reduced-transparency': 'no-preference',
+  'forced-colors': 'none',
+  'inverted-colors': 'none',
+  'navigation-controls': 'none',
+  'environment-blending': 'none',
+};
+const _mediaNumericFeatures = {
+  'color': () => 8,
+  'color-index': () => 0,
+  'monochrome': () => 0,
+  'grid': () => 0,
+  'horizontal-viewport-segments': () => 1,
+  'vertical-viewport-segments': () => 1,
+  'resolution': () => Number(globalThis.devicePixelRatio) || 1,
+  '-webkit-device-pixel-ratio': () => Number(globalThis.devicePixelRatio) || 1,
+  'device-width': () => Number(globalThis.screen && globalThis.screen.width) || 1920,
+  'device-height': () => Number(globalThis.screen && globalThis.screen.height) || 1080,
+  'aspect-ratio': () => _mediaViewportDimension('width') / (_mediaViewportDimension('height') || 1),
+  'device-aspect-ratio': () => {
+    const w = Number(globalThis.screen && globalThis.screen.width) || 1920;
+    const h = Number(globalThis.screen && globalThis.screen.height) || 1080;
+    return w / h;
+  },
+};
+
+// resolution accepts dppx/x/dpi/dpcm; everything else is px or a/b ratios.
+function _parseMediaNumeric(feature, value) {
+  if (feature === 'resolution' || feature === '-webkit-device-pixel-ratio') {
+    const m = String(value).match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(dppx|x|dpi|dpcm)$/i);
+    if (!m) return null;
+    const n = Number(m[1]);
+    if (!Number.isFinite(n)) return null;
+    const unit = m[2].toLowerCase();
+    if (unit === 'dppx' || unit === 'x') return n;
+    if (unit === 'dpi') return n / 96;
+    return n * 2.54 / 96;
+  }
+  if (feature === 'aspect-ratio' || feature === 'device-aspect-ratio') {
+    const m = String(value).match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:\/\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)))?$/);
+    if (!m) return null;
+    const a = Number(m[1]), b = m[2] === undefined ? 1 : Number(m[2]);
+    return Number.isFinite(a) && Number.isFinite(b) && b !== 0 ? a / b : null;
+  }
+  const px = _parseMediaPx(value);
+  if (px !== null) return px;
+  const plain = Number(value);
+  return Number.isFinite(plain) ? plain : null;
+}
+
+function _evaluateMediaFeatureValue(minmax, name, value) {
+  if (minmax) {
+    const numeric = _mediaNumericFeatures[name];
+    if (!numeric || value === null) return false;
+    const expected = _parseMediaNumeric(name, value);
+    if (expected === null) return false;
+    const actual = numeric();
+    return minmax === 'min-' ? actual >= expected : actual <= expected;
+  }
+  if (_mediaNumericFeatures[name]) {
+    const actual = _mediaNumericFeatures[name]();
+    if (value === null) return actual !== 0;
+    const expected = _parseMediaNumeric(name, value);
+    return expected !== null && actual === expected;
+  }
+  if (_mediaEnumFeatures[name] !== undefined) {
+    const actual = _mediaEnumFeatures[name];
+    // Bare enum features match unless their value is 'none'.
+    if (value === null) return actual !== 'none';
+    return actual === value;
+  }
   return false;
 }
 
@@ -10254,7 +10597,8 @@ function _evaluateMediaQueryList(query) {
 
 globalThis.matchMedia = _markNative(function matchMedia(q) {
   const media = q == null ? '' : String(q);
-  return new MediaQueryList(_mediaQueryToken, media);
+  // Blink serializes a space after each feature colon: '(min-width: 0px)'.
+  return new MediaQueryList(_mediaQueryToken, media.replace(/:\s*/g, ': '));
 });
 const _mediaQueryToken = {};
 const _mediaQueries = new Set();
@@ -13106,7 +13450,7 @@ globalThis.performance = globalThis.performance || {
     // synthetic per-call increment keeps tight loops from advancing the clock
     // faster than real elapsed time.
     var _last = -Infinity;
-    return function() {
+    return function now() {
       var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
       if (ms < _last) return _last;
       _last = ms;
@@ -13133,15 +13477,17 @@ globalThis.performance = globalThis.performance || {
   globalThis.Performance = class Performance {
     constructor() { throw new TypeError('Illegal constructor'); }
   };
+  // Performance is an EventTarget (resourcetimingbufferfull).
+  Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
   Object.setPrototypeOf(perf, Performance.prototype);
-  const buffers = Object.assign(Object.create(null), {mark: [], measure: []});
+  const buffers = Object.assign(Object.create(null), {mark: [], measure: [], navigation: [], resource: [], paint: [], event: [], 'first-input': [], 'layout-shift': [], 'largest-contentful-paint': [], longtask: [], 'visibility-state': []});
   const latestMarks = new Map();
   const entryState = new WeakMap();
   const observerState = new WeakMap();
   const listState = new WeakMap();
   const observers = new Set();
   const entryKey = {};
-  const supported = Object.freeze(['mark', 'measure']);
+  const supported = Object.freeze(['element', 'event', 'first-input', 'largest-contentful-paint', 'layout-shift', 'longtask', 'mark', 'measure', 'navigation', 'paint', 'resource', 'visibility-state']);
   const timingNames = new Set([
     'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
     'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
@@ -13187,12 +13533,16 @@ globalThis.performance = globalThis.performance || {
     return entryState.get(mark).startTime;
   }
   function entries(buffer, name, type) {
-    return buffer.filter(entry => {
+    return (buffer || []).filter(entry => {
       const data = entryState.get(entry);
       return (name === undefined || data.name === name) && (type === undefined || data.entryType === type);
     }).sort((a, b) => entryState.get(a).startTime - entryState.get(b).startTime);
   }
-  function allEntries() { return buffers.mark.concat(buffers.measure); }
+  function allEntries() {
+    var out = [];
+    for (const type of Object.keys(buffers)) out = out.concat(buffers[type]);
+    return out;
+  }
   function checkPerformance(receiver) {
     if (receiver !== perf) throw new TypeError('Illegal invocation');
   }
@@ -13235,6 +13585,114 @@ globalThis.performance = globalThis.performance || {
       return data.detail;
     }
   };
+  // Navigation Timing / Resource Timing. Entries carry a `nav`/`res` payload
+  // in entryState; getters read it like the WebIDL attributes Chrome exposes.
+  globalThis.PerformanceNavigationTiming = class PerformanceNavigationTiming extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get name() { try { return String(globalThis.location.href); } catch (_e) { return ''; } }
+    toJSON() {
+      const d = state(entryState, this).nav;
+      const out = { name: this.name, entryType: 'navigation', startTime: 0, duration: d.duration, serverTiming: [] };
+      for (const k of _navTimingKeys) out[k] = d[k];
+      return out;
+    }
+  };
+  const _navTimingKeys = [
+    'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'workerStart',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'firstInterimResponseStart',
+    'finalResponseHeadersStart', 'responseEnd', 'transferSize', 'encodedBodySize',
+    'decodedBodySize', 'responseStatus', 'renderBlockingStatus', 'domInteractive',
+    'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+    'loadEventStart', 'loadEventEnd', 'type', 'redirectCount', 'activationStart',
+    'criticalCHRestart', 'nextHopProtocol', 'deliveryType',
+  ];
+  for (const _nk of _navTimingKeys) {
+    Object.defineProperty(PerformanceNavigationTiming.prototype, _nk, {
+      get: function() { return state(entryState, this).nav[_nk]; },
+      enumerable: true, configurable: true,
+    });
+  }
+  Object.defineProperty(PerformanceNavigationTiming.prototype, 'serverTiming', {
+    get: function() { state(entryState, this); return []; },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(PerformanceNavigationTiming.prototype, 'notRestoredReasons', {
+    get: function() { state(entryState, this); return null; },
+    enumerable: true, configurable: true,
+  });
+  globalThis.PerformanceResourceTiming = class PerformanceResourceTiming extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    toJSON() {
+      const d = state(entryState, this);
+      const r = d.res;
+      const out = { name: d.name, entryType: 'resource', startTime: d.startTime, duration: d.duration, serverTiming: [] };
+      for (const k of _resTimingKeys) out[k] = r[k];
+      return out;
+    }
+  };
+  const _resTimingKeys = [
+    'initiatorType', 'nextHopProtocol', 'workerStart', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'firstInterimResponseStart',
+    'finalResponseHeadersStart', 'responseEnd', 'transferSize', 'encodedBodySize',
+    'decodedBodySize', 'responseStatus', 'renderBlockingStatus', 'deliveryType',
+  ];
+  for (const _rk of _resTimingKeys) {
+    Object.defineProperty(PerformanceResourceTiming.prototype, _rk, {
+      get: function() { return state(entryState, this).res[_rk]; },
+      enumerable: true, configurable: true,
+    });
+  }
+  Object.defineProperty(PerformanceResourceTiming.prototype, 'serverTiming', {
+    get: function() { state(entryState, this); return []; },
+    enumerable: true, configurable: true,
+  });
+  // Chrome always reports exactly one navigation entry for the current
+  // document; an empty list is a headless tell.
+  const _navData = {
+    unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0,
+    workerStart: 0, fetchStart: 0, domainLookupStart: 0, domainLookupEnd: 0,
+    connectStart: 0, connectEnd: 0, secureConnectionStart: 0,
+    requestStart: 0, responseStart: 0, firstInterimResponseStart: 0,
+    finalResponseHeadersStart: 0, responseEnd: 0,
+    transferSize: 0, encodedBodySize: 0, decodedBodySize: 0,
+    responseStatus: 200, renderBlockingStatus: 'non-blocking',
+    domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0,
+    domComplete: 0, loadEventStart: 0, loadEventEnd: 0, duration: 0,
+    type: 'navigate', redirectCount: 0, activationStart: 0, criticalCHRestart: 0,
+    nextHopProtocol: 'h2', deliveryType: 'navigational-payload',
+  };
+  function _seedNavigationEntry() {
+    try {
+      const timing = JSON.parse(_dom('performance_timing') || '{}');
+      const origin = +(_dom('performance_time_origin') || 0) || Date.now();
+      const rel = (k) => { const v = +timing[k] || 0; return v > 0 ? v - origin : 0; };
+      _navData.fetchStart = Math.max(0, rel('fetchStart'));
+      _navData.requestStart = Math.max(_navData.fetchStart, rel('requestStart'));
+      _navData.responseStart = Math.max(_navData.requestStart, rel('responseStart'));
+      _navData.responseEnd = Math.max(_navData.responseStart, rel('responseEnd'));
+      _navData.domInteractive = Math.max(_navData.responseEnd, rel('domInteractive'));
+      _navData.domContentLoadedEventStart = Math.max(_navData.domInteractive, rel('domContentLoadedEventStart'));
+      _navData.domContentLoadedEventEnd = Math.max(_navData.domContentLoadedEventStart, rel('domContentLoadedEventEnd'));
+      _navData.domComplete = Math.max(_navData.domContentLoadedEventEnd, rel('domComplete'));
+      _navData.loadEventStart = Math.max(_navData.domComplete, rel('loadEventStart'));
+      _navData.loadEventEnd = Math.max(_navData.loadEventStart, rel('loadEventEnd'));
+      _navData.duration = _navData.loadEventEnd;
+    } catch (_e) {}
+    const entry = Object.create(PerformanceNavigationTiming.prototype);
+    entryState.set(entry, {
+      name: '', entryType: 'navigation', startTime: 0,
+      duration: _navData.duration, nav: _navData,
+    });
+    buffers.navigation = [entry];
+  }
+  _seedNavigationEntry();
+  // __obscura_init calls this after a real navigation so the entry's
+  // timestamps mirror the loaded document instead of snapshot-time zeros.
+  _pageSeedNavigationEntry = _seedNavigationEntry;
+  perf.clearResourceTimings = function clearResourceTimings() { checkPerformance(this); buffers.resource = []; };
+  perf.setResourceTimingBufferSize = function setResourceTimingBufferSize(_maxSize) { checkPerformance(this); };
   function queueDelivery() {
     if (deliveryPending) return;
     deliveryPending = true;
@@ -13376,7 +13834,7 @@ globalThis.performance = globalThis.performance || {
       else data.types.add(type);
       observers.add(this);
       if (buffered) {
-        for (const entry of buffers[type]) data.records.push(entry);
+        for (const entry of (buffers[type] || [])) data.records.push(entry);
         if (data.records.length) queueDelivery();
       }
     }
@@ -13394,11 +13852,12 @@ globalThis.performance = globalThis.performance || {
     }
     static get supportedEntryTypes() { return supported; }
   };
-  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'getEntries', 'getEntriesByType', 'getEntriesByName']) {
+  _markNative(perf.now);
+  for (const name of ['now', 'mark', 'measure', 'clearMarks', 'clearMeasures', 'clearResourceTimings', 'setResourceTimingBufferSize', 'getEntries', 'getEntriesByType', 'getEntriesByName', 'timeOrigin']) {
     Object.defineProperty(Performance.prototype, name, Object.getOwnPropertyDescriptor(perf, name));
     delete perf[name];
   }
-  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
+  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceNavigationTiming', 'PerformanceResourceTiming', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
     Object.defineProperty(globalThis, name, {enumerable: false});
     const proto = globalThis[name].prototype;
     Object.defineProperty(proto, Symbol.toStringTag, {value: name, configurable: true});
@@ -13519,7 +13978,7 @@ function _structuredClone(value, seen) {
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof SharedArrayBuffer) {
+  if (_SharedArrayBuffer && value instanceof _SharedArrayBuffer) {
     return value; // transferable, not copyable
   }
   if (value instanceof Date) return new Date(value.getTime());
@@ -15416,7 +15875,7 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.prepend = Element.prototype.prepend;
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
-globalThis.EventTarget = Node;
+globalThis.EventTarget = EventTarget;
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -16676,14 +17135,43 @@ function _connectInsertedResources(root, html) {
   }
 }
 
-function _ensureInitialFrameRealm(element, srcdoc) {
-  if (element._frameId || !element.isConnected) return;
+// Claims a frame id and context for an initial-document iframe without paying
+// for a V8 realm. Realms are materialized by _ensureInitialFrameRealm on the
+// first script touch (contentWindow, contentDocument, window[i]), so a page
+// that plants scriptless frames keeps only the cheap bookkeeping.
+function _declareInitialFrame(element, srcdoc) {
+  if (element._frameId) return element._frameId;
+  if (!element.isConnected) return 0;
+  // An opaque sandbox must never receive the creator's security token; an
+  // opaque blank frame is served by the remote window surface instead.
+  if (element.hasAttribute('sandbox') && srcdoc === undefined &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin')) {
+    element._iframeOpaque = true;
+    return 0;
+  }
   _connectFrameContext(element);
-  // An opaque sandbox must never receive the creator's security token.
-  let opaque = element.hasAttribute('sandbox') &&
-      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
-  if (opaque && srcdoc === undefined) return false;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
+  _syncWindowIndices();
+  const frameId = __obscuraCore.ops.op_declare_frame(_realmFrameId, element._nid,
+      srcdoc !== undefined);
+  if (!frameId) return 0;
+  element._frameId = frameId;
+  element._frameDeclared = true;
+  globalThis.__obscura_frameElements[frameId] = element;
+  return frameId;
+}
+
+function _ensureInitialFrameRealm(element, srcdoc) {
+  if (element._iframeRealm) return true;
+  if (!_declareInitialFrame(element, srcdoc)) return false;
+  // A frame id that op_frame_document_ready assigned belongs to a fetched
+  // document: its realm is built by the host adoption path, never by
+  // op_initial_frame's blank snapshot.
+  if (!element._frameDeclared) return undefined;
+  const frameId = element._frameId;
+  let opaque = element._iframeOpaque === true ||
+      (element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin'));
+  const built = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
     opaque = sandboxOpaque;
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
@@ -16710,9 +17198,9 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     }
     child.innerWidth = 300;
     child.innerHeight = 150;
-  }, element._nid, srcdoc);
-  if (frameId) {
-    element._frameId = frameId;
+  }, element._nid, srcdoc, frameId);
+  if (built) {
+    element._iframeRealm = true;
     element._iframeOpaque = opaque;
     element._iframeWin = opaque ? _remoteWindow(frameId)
       : globalThis.__obscura_frameObjects[frameId].window;
@@ -16735,7 +17223,10 @@ function _ensureInitialFrameRealm(element, srcdoc) {
 
 function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
+  _syncWindowIndices();
   element._frameId = 0;
+  element._frameDeclared = false;
+  element._iframeRealm = false;
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
   element._iframeRequest = null;
@@ -17076,23 +17567,20 @@ function _encodePNG(w, h, rgba) {
       raw[d] = rgba[s]; raw[d+1] = rgba[s+1]; raw[d+2] = rgba[s+2]; raw[d+3] = rgba[s+3];
     }
   }
-  // Adler32 of raw
-  var s1 = 1, s2 = 0, M = 65521;
-  for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
-  var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
+  // zlib DEFLATE at default level via the codec op: stored (uncompressed)
+  // blocks are a fingerprint tell versus a real browser PNG encoder.
+  var C64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var b64in = '';
+  for (var i = 0; i < raw.length; i += 3) {
+    var n0 = raw[i], n1 = i + 1 < raw.length ? raw[i + 1] : 0, n2 = i + 2 < raw.length ? raw[i + 2] : 0;
+    b64in += C64[n0 >> 2] + C64[((n0 & 3) << 4) | (n1 >> 4)] +
+      (i + 1 < raw.length ? C64[((n1 & 15) << 2) | (n2 >> 6)] : '=') +
+      (i + 2 < raw.length ? C64[n2 & 63] : '=');
   }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  var zB64 = __obscuraCore.ops.op_compress('compress', 'deflate', b64in);
+  var zBin = atob(zB64);
+  var def = new Uint8Array(zBin.length);
+  for (var i = 0; i < zBin.length; i++) def[i] = zBin.charCodeAt(i);
   // CRC32 (lazy table)
   if (!_encodePNG._t) {
     var t = new Uint32Array(256);
@@ -17114,7 +17602,7 @@ function _encodePNG(w, h, rgba) {
   ihd[0]=(w>>24)&0xff; ihd[1]=(w>>16)&0xff; ihd[2]=(w>>8)&0xff; ihd[3]=w&0xff;
   ihd[4]=(h>>24)&0xff; ihd[5]=(h>>16)&0xff; ihd[6]=(h>>8)&0xff; ihd[7]=h&0xff;
   ihd[8]=8; ihd[9]=6; // 8-bit RGBA
-  var png = new Uint8Array(8 + 25 + (12+dlen) + 12);
+  var png = new Uint8Array(8 + 25 + (12 + def.length) + 12);
   png.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
   var p = 8;
   p = putChunk(png, p, 'IHDR', ihd);
@@ -17555,6 +18043,11 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+    if (globalThis.__obscura_stealth && typeof _createWebGLContext === 'function') {
+      var glKey = type === 'webgl2' ? '_glCtx2' : '_glCtx1';
+      if (!this[glKey]) this[glKey] = _createWebGLContext(this, type === 'webgl2');
+      if (this[glKey]) return this[glKey];
+    }
     // Context creation is allowed to fail, and that is the only truthful
     // behavior until the renderer has a real WebGL backend. The former shim
     // reported successful shader/program creation while every draw call was a
@@ -17673,7 +18166,10 @@ globalThis.AudioBuffer = class AudioBuffer {
   copyToChannel(src, ch, start) { var d=this._chs[ch]||this._chs[0]; start=start||0; if(d) for(var i=0;i<src.length;i++) d[start+i]=src[i]; }
 };
 globalThis.AudioContext = class AudioContext {
-  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  constructor() { this.sampleRate=_fp('audioSampleRate'); this._aState='suspended'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.outputLatency=0; this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; this._listeners={}; }
+  // Chrome starts an AudioContext suspended under the autoplay policy until a
+  // user activation unlocks it (or resume() runs); 'closed' stays sticky.
+  get state() { return this._aState === 'closed' ? 'closed' : ((__obscura_ua.ever || this._aState === 'running') ? 'running' : 'suspended'); }
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
@@ -17691,9 +18187,9 @@ globalThis.AudioContext = class AudioContext {
   createBuffer(ch,len,rate) { return new globalThis.AudioBuffer({numberOfChannels:ch||1,length:len||0,sampleRate:rate||44100}); }
   createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
   decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
-  resume() { this.state='running'; return Promise.resolve(); }
-  suspend() { this.state='suspended'; return Promise.resolve(); }
-  close() { this.state='closed'; return Promise.resolve(); }
+  resume() { this._aState='running'; return Promise.resolve(); }
+  suspend() { this._aState='suspended'; return Promise.resolve(); }
+  close() { this._aState='closed'; return Promise.resolve(); }
 };
 globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
   constructor(ch,len,rate) {
@@ -19563,7 +20059,7 @@ if (typeof SharedWorker === 'undefined') {
   };
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
-  globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
+  globalThis.ServiceWorkerContainer = class ServiceWorkerContainer { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
 }
 
 if (typeof URLPattern === 'undefined') {
@@ -19876,8 +20372,14 @@ globalThis.__obscura_init_frames = function() {
     const src = frame.getAttribute('src');
     if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
     else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
-    else if (_ensureInitialFrameRealm(frame)) frame.dispatchEvent(new Event('load'));
+    else {
+      // Declare only: see the insertion sweep for why realm creation defers
+      // to first script access.
+      _declareInitialFrame(frame);
+      frame.dispatchEvent(new Event('load'));
+    }
   }
+  _syncWindowIndices();
 
 };
 
@@ -19907,7 +20409,20 @@ globalThis.__obscura_init = (function(skipFrames) {
 
   const documentNid = +_dom("document_node_id");
   const document = new Document(documentNid);
+  // Chrome's document is an HTMLDocument: constructor.name and the prototype
+  // chain both report it, while XML/detached documents stay plain Document.
+  if (globalThis.HTMLDocument) {
+    try { Object.setPrototypeOf(document, globalThis.HTMLDocument.prototype); } catch (_e) {}
+  }
   _document = document;
+  // `all` is an own, non-configurable accessor on each connected document
+  // ([LegacyUnforgeable]), not just the prototype getter.
+  try {
+    var _allDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'all');
+    if (_allDesc && _allDesc.get) {
+      Object.defineProperty(document, 'all', { get: _allDesc.get, enumerable: true, configurable: false });
+    }
+  } catch (_e) {}
   // parentNode on <html> reaches the backing document node. Keep that wrapper
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
@@ -19932,18 +20447,25 @@ globalThis.__obscura_init = (function(skipFrames) {
   const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
     ? globalThis.__obscura_viewport_h : sh - 80;
   _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
-  globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+  var _vv = { width:vw, height:vh, offsetLeft:0, offsetTop:0, pageLeft:0, pageTop:0, scale:1, onresize:null, onscroll:null, onscrollend:null, addEventListener(){}, removeEventListener(){} };
+  if (globalThis.VisualViewport) {
+    try { _vv = Object.assign(Object.create(globalThis.VisualViewport.prototype), _vv); } catch (_e) {}
+  }
+  globalThis.visualViewport = _vv;
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  // Windowed Chrome: the outer frame adds the toolbar/tab strip vertically
+  // (~85-90px) and no side chrome when maximized. outer === inner is the
+  // headless signature; a small vertical delta matches a real window.
+  globalThis.outerWidth = vw; globalThis.outerHeight = vh + 87;
 
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  // hardwareConcurrency/deviceMemory must be stable for the profile across
+  // every page: a value that rerolls per navigation is an inconsistency tell.
+  globalThis.__obscura_hw = 8;
+  globalThis.__obscura_mem = 8;
 
   const timing = {};
   for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
@@ -19957,6 +20479,9 @@ globalThis.__obscura_init = (function(skipFrames) {
   Object.defineProperty(globalThis.performance, 'timing', {
     configurable: true, value: timing, writable: false,
   });
+  if (typeof _pageSeedNavigationEntry === 'function') {
+    _pageSeedNavigationEntry();
+  }
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,
@@ -19975,6 +20500,17 @@ globalThis.__obscura_init = (function(skipFrames) {
   _installFramingRelationships();
 
   if (!skipFrames && JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
+  _syncWindowIndices();
+  // window -> Window.prototype -> EventTarget.prototype -> Object.prototype.
+  try { Object.setPrototypeOf(globalThis, globalThis.Window.prototype); } catch (_e) {}
+  // Chrome exposes none of these in an ordinary page: Temporal is not yet
+  // stable, SharedArrayBuffer is gated on crossOriginIsolated, and
+  // ContentIndex behind a flag. Deletes only take at runtime, not at
+  // snapshot-build time, so they live in per-page init.
+  delete globalThis.Temporal;
+  _SharedArrayBuffer = _SharedArrayBuffer || globalThis.SharedArrayBuffer;
+  delete globalThis.SharedArrayBuffer;
+  delete globalThis.ContentIndex;
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
@@ -20551,6 +21087,1227 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // accessors) plus the constructor itself native. This runs once at snapshot
 // build time, so it costs nothing per page, and genuinely-native V8 builtins
 // already report native, so only the JS-backed members are affected.
+function _installChromeSurface(G) {
+  // Fingerprint scripts enumerate window constructors and read interface
+  // identity (constructor.name, Symbol.toStringTag, prototype shape), so every
+  // name desktop Chrome exposes on window needs the right name and prototype.
+  // Most entries are inert stubs satisfying feature detection; a few carry
+  // real behavior (Permissions, CacheStorage, CookieStore, CompressionStream).
+  function _defClass(name, base) {
+    if (typeof G[name] === 'function') return G[name];
+    var ctor = base ? class extends base {} : class {};
+    try { Object.defineProperty(ctor, 'name', { value: name, configurable: true }); } catch (_e) {}
+    _markNativeAs(ctor, 'function ' + name + '() { [native code] }');
+    if (ctor.prototype) {
+      try { Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (_e) {}
+    }
+    G[name] = ctor;
+    return ctor;
+  }
+  function _defNs(name, obj) { if (G[name] === undefined) G[name] = obj; }
+  function _inst(ctor) { return Object.create(ctor.prototype); }
+  function _fn(name, fn) {
+    try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_e) {}
+    return _markNative(fn);
+  }
+  function _getter(obj, key, value) {
+    Object.defineProperty(obj, key, {
+      get: _fn('get ' + key, function() { return value; }),
+      enumerable: true, configurable: true,
+    });
+  }
+
+  // --- Constructors ---
+  const _Event = G.Event || Object;
+  const _Error = G.Error;
+  const _Element = G.HTMLElement || G.Element || Object;
+  'AnimationPlaybackEvent AudioProcessingEvent BeforeInstallPromptEvent BlobEvent CharacterBoundsUpdateEvent CloseEvent CommandEvent ContentVisibilityAutoStateChangeEvent CookieChangeEvent DeviceMotionEvent DeviceOrientationEvent DocumentPictureInPictureEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent GPUUncapturedErrorEvent HIDConnectionEvent HIDInputReportEvent InterestEvent MIDIConnectionEvent MIDIMessageEvent MediaEncryptedEvent MediaKeyMessageEvent MediaStreamEvent MediaStreamTrackEvent NavigateEvent NavigationCurrentEntryChangeEvent OfflineAudioCompletionEvent PageRevealEvent PageSwapEvent PageTransitionEvent PaymentMethodChangeEvent PaymentRequestUpdateEvent PictureInPictureEvent PresentationConnectionAvailableEvent PresentationConnectionCloseEvent RTCDataChannelEvent RTCDTMFToneChangeEvent RTCErrorEvent RTCPeerConnectionIceErrorEvent RTCPeerConnectionIceEvent RTCTrackEvent SecurityPolicyViolationEvent SensorErrorEvent SnapEvent SpeechRecognitionErrorEvent SpeechRecognitionEvent SpeechSynthesisErrorEvent SpeechSynthesisEvent TaskPriorityChangeEvent TextEvent TextFormatUpdateEvent TextUpdateEvent TouchEvent TrackEvent USBConnectionEvent VirtualKeyboardGeometryChangeEvent WebGLContextEvent WindowControlsOverlayGeometryChangeEvent XRInputSourceEvent XRInputSourcesChangeEvent XRReferenceSpaceEvent XRSessionEvent'
+    .split(' ').forEach(function(n) { _defClass(n, _Event); });
+  'DOMError IdentityCredentialError OverconstrainedError QuotaExceededError RTCError WebSocketError WebTransportError GPUError GPUInternalError GPUOutOfMemoryError GPUPipelineError GPUValidationError'
+    .split(' ').forEach(function(n) { _defClass(n, _Error); });
+  var _Sensor = _defClass('Sensor');
+  'AbsoluteOrientationSensor Accelerometer GravitySensor Gyroscope LinearAccelerationSensor OrientationSensor RelativeOrientationSensor'
+    .split(' ').forEach(function(n) { _defClass(n, _Sensor); });
+  var _AudioNode = _defClass('AudioNode');
+  _defClass('AudioScheduledSourceNode', _AudioNode);
+  'AnalyserNode AudioBufferSourceNode AudioDestinationNode AudioWorkletNode BiquadFilterNode ChannelMergerNode ChannelSplitterNode ConstantSourceNode ConvolverNode DelayNode DynamicsCompressorNode GainNode IIRFilterNode MediaElementAudioSourceNode MediaStreamAudioDestinationNode MediaStreamAudioSourceNode OscillatorNode PannerNode ScriptProcessorNode StereoPannerNode WaveShaperNode'
+    .split(' ').forEach(function(n) { _defClass(n, _AudioNode); });
+  var _WebGLObject = _defClass('WebGLObject');
+  'WebGLBuffer WebGLFramebuffer WebGLProgram WebGLQuery WebGLRenderbuffer WebGLSampler WebGLShader WebGLSync WebGLTexture WebGLTransformFeedback WebGLVertexArrayObject'
+    .split(' ').forEach(function(n) { _defClass(n, _WebGLObject); });
+  'WebGLActiveInfo WebGLShaderPrecisionFormat WebGLUniformLocation'
+    .split(' ').forEach(function(n) { _defClass(n); });
+  _defClass('Sanitizer');
+  _defClass('Config');
+  var _AuthenticatorResponse = _defClass('AuthenticatorResponse');
+  _defClass('AuthenticatorAssertionResponse', _AuthenticatorResponse);
+  _defClass('AuthenticatorAttestationResponse', _AuthenticatorResponse);
+  var _Credential = _defClass('Credential');
+  'FederatedCredential PasswordCredential OTPCredential IdentityCredential DigitalCredential'
+    .split(' ').forEach(function(n) { _defClass(n, _Credential); });
+  _defClass('HTMLFencedFrameElement', _Element);
+  _defClass('HTMLSelectedContentElement', _Element);
+  _defClass('DocumentPictureInPicture');
+  _defClass('XRSystem');
+  _defClass('CredentialsContainer');
+  _defClass('GPUPipelineLayout');
+  _defClass('HTMLFormControlsCollection');
+  _defClass('HTMLOptionsCollection');
+  _defClass('PeriodicWave');
+  _defClass('ScrollTimeline');
+  _defClass('SharedStorageSetMethod');
+  _defClass('MathMLElement', G.Element || Object);
+  _defClass('SVGMPathElement', G.SVGElement || G.Element || Object);
+  var _ReportBody = _defClass('ReportBody');
+  _defClass('CSPViolationReportBody', _ReportBody);
+  _defClass('IntegrityViolationReportBody', _ReportBody);
+  _defClass('XPathResult');
+  _defClass('XRSpace', EventTargetOrObject());
+  function EventTargetOrObject() {
+    return (G.EventTarget && G.EventTarget !== G.Node) ? G.EventTarget : Object;
+  }
+  // Constructor-name surface: presence + identity, inert behavior.
+  'AbstractRange AnimationEffect AnimationTimeline AudioData AudioDecoder AudioEncoder AudioListener AudioParam AudioParamMap AudioSinkInfo AudioWorklet BackgroundFetchManager BackgroundFetchRecord BackgroundFetchRegistration BatteryManager BrowserCaptureMediaStreamTrack CanvasCaptureMediaStreamTrack CanvasGradient CanvasPattern CaptureController ChapterInformation Clipboard ClipboardItem CloseWatcher CreateMonitor CropTarget CSSAnimation CSSContainerRule CSSCounterStyleRule CSSFontFaceRule CSSFontFeatureValuesRule CSSFontPaletteValuesRule CSSFunctionDeclarations CSSFunctionDescriptors CSSFunctionRule CSSImageValue CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSKeywordValue CSSLayerBlockRule CSSLayerStatementRule CSSMarginRule CSSMathClamp CSSMathInvert CSSMathMax CSSMathMin CSSMathNegate CSSMathProduct CSSMathSum CSSMathValue CSSMatrixComponent CSSNamespaceRule CSSNestedDeclarations CSSNumericArray CSSNumericValue CSSPageRule CSSPerspective CSSPositionTryDescriptors CSSPositionTryRule CSSPositionValue CSSPropertyRule CSSRotate CSSScale CSSScopeRule CSSSkew CSSSkewX CSSSkewY CSSStartingStyleRule CSSStyleValue CSSTransformComponent CSSTransformValue CSSTransition CSSTranslate CSSUnitValue CSSUnparsedValue CSSVariableReferenceValue CSSViewTransitionRule CustomStateSet DOMMatrixReadOnly DOMPointReadOnly DOMQuad DOMRectReadOnly DataTransfer DataTransferItem DataTransferItemList DelegatedInkTrailPresenter DeviceMotionEventAcceleration DeviceMotionEventRotationRate DevicePosture DOMStringList EditContext EncodedAudioChunk EncodedVideoChunk EventCounts External EyeDropper FeaturePolicy FederatedCredential Fence FencedFrameConfig FetchLaterResult FileSystemDirectoryHandle FileSystemFileHandle FileSystemHandle FileSystemObserver FileSystemWritableFileStream FontData FragmentDirective GPU GPUAdapter GPUAdapterInfo GPUBindGroup GPUBindGroupLayout GPUBuffer GPUCanvasContext GPUCommandBuffer GPUCommandEncoder GPUCompilationInfo GPUCompilationMessage GPUComputePassEncoder GPUComputePipeline GPUDevice GPUDeviceLostInfo GPUError GPUExternalTexture GPUQuerySet GPUQueue GPURenderBundle GPURenderBundleEncoder GPURenderPassEncoder GPURenderPipeline GPUSampler GPUShaderModule GPUSupportedFeatures GPUSupportedLimits GPUTexture GPUTextureView Gamepad GamepadButton GamepadHapticActuator Geolocation GeolocationCoordinates GeolocationPosition GeolocationPositionError HID HIDDevice Highlight HighlightRegistry IDBRecord IdentityProvider IdleDeadline IdleDetector ImageBitmapRenderingContext ImageCapture ImageDecoder ImageTrack ImageTrackList Ink InputDeviceCapabilities InputDeviceInfo Keyboard KeyboardLayoutMap LanguageDetector LargestContentfulPaint LaunchParams LaunchQueue LayoutShift LayoutShiftAttribution Location Lock LockManager MIDIAccess MIDIInput MIDIInputMap MIDIOutput MIDIOutputMap MIDIPort MathMLElement MediaCapabilities MediaDeviceInfo MediaDevices MediaError MediaKeySession MediaKeyStatusMap MediaKeySystemAccess MediaKeys MediaList MediaMetadata MediaRecorder MediaSession MediaSource MediaSourceHandle MediaStreamTrackAudioStats MediaStreamTrackGenerator MediaStreamTrackProcessor MediaStreamTrackVideoStats Navigation NavigationActivation NavigationDestination NavigationHistoryEntry NavigationPrecommitController NavigationPreloadManager NavigationTransition NavigatorLogin NavigatorManagedData NavigatorUAData NodeIterator NotRestoredReasonDetails NotRestoredReasons Observable OffscreenCanvasRenderingContext2D PaymentAddress PaymentManager PaymentRequest PaymentResponse PerformanceElementTiming PerformanceEventTiming PerformanceLongAnimationFrameTiming PerformanceLongTaskTiming PerformanceNavigation PerformancePaintTiming PerformanceScriptTiming PerformanceServerTiming PerformanceTiming PeriodicSyncManager PictureInPictureWindow Presentation PresentationAvailability PresentationConnection PresentationConnectionList PresentationReceiver PresentationRequest PressureObserver PressureRecord Profiler ProtectedAudience PushManager PushSubscription PushSubscriptionOptions RadioNodeList ReadableByteStreamController ReadableStreamBYOBReader ReadableStreamBYOBRequest ReadableStreamDefaultController ReadableStreamDefaultReader RemotePlayback ReportingObserver RestrictionTarget RTCCertificate RTCDTMFSender RTCDataChannel RTCDtlsTransport RTCEncodedAudioFrame RTCEncodedVideoFrame RTCIceTransport RTCPeerConnectionIceErrorEvent RTCRtpReceiver RTCRtpScriptTransform RTCRtpSender RTCRtpTransceiver RTCSctpTransport RTCStatsReport SVGAngle SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGLength SVGLengthList SVGMatrix SVGNumber SVGNumberList SVGPoint SVGPointList SVGPreserveAspectRatio SVGRect SVGStringList SVGTransform SVGTransformList Scheduling ScreenDetailed ScreenDetails ScreenOrientation Serial SerialPort ServiceWorker ServiceWorkerRegistration SharedStorage SharedStorageAppendMethod SharedStorageClearMethod SharedStorageDeleteMethod SharedStorageModifierMethod SharedStorageWorklet SourceBuffer SourceBufferList SpeechGrammar SpeechGrammarList SpeechRecognition SpeechRecognitionPhrase SpeechSynthesis SpeechSynthesisVoice StorageBucket StorageBucketManager StorageManager StylePropertyMap StylePropertyMapReadOnly Subscriber Summarizer SyncManager TaskAttributionTiming TaskController TaskSignal TextFormat TextMetrics TimeRanges Touch TouchList TransformStreamDefaultController Translator TrustedHTML TrustedScript TrustedScriptURL TrustedTypePolicy TrustedTypePolicyFactory USB USBAlternateInterface USBConfiguration USBDevice USBEndpoint USBInTransferResult USBInterface USBIsochronousInTransferPacket USBIsochronousInTransferResult USBIsochronousOutTransferPacket USBIsochronousOutTransferResult USBOutTransferResult UserActivation VideoColorSpace VideoDecoder VideoEncoder VideoFrame VideoPlaybackQuality ViewTimeline ViewTransition ViewTransitionTypeSet Viewport VirtualKeyboard VisibilityStateEntry VisualViewport WGSLLanguageFeatures WakeLock WakeLockSentinel WebKitCSSMatrix WebKitMutationObserver WebSocketStream WebTransport WebTransportBidirectionalStream WebTransportDatagramDuplexStream WindowControlsOverlay Worklet WritableStreamDefaultController WritableStreamDefaultWriter XMLHttpRequestUpload XPathEvaluator XPathExpression XRAnchor XRAnchorSet XRBoundedReferenceSpace XRCPUDepthInformation XRCamera XRDOMOverlayState XRDepthInformation XRFrame XRHand XRHitTestResult XRHitTestSource XRInputSource XRInputSourceArray XRJointPose XRJointSpace XRLayer XRLightEstimate XRLightProbe XRPose XRRay XRReferenceSpace XRRenderState XRRigidTransform XRSession XRTransientInputHitTestResult XRTransientInputHitTestSource XRView XRViewerPose XRViewport XRWebGLBinding XRWebGLDepthInformation XRWebGLLayer XSLTProcessor'
+    .split(' ').forEach(function(n) { _defClass(n); });
+  // Namespace objects Chrome exposes as plain objects, not constructors.
+  _defNs('SVGUnitTypes', Object.freeze({ SVG_UNIT_TYPE_UNKNOWN: 0, SVG_UNIT_TYPE_USERSPACEONUSE: 1, SVG_UNIT_TYPE_OBJECTBOUNDINGBOX: 2 }));
+  _defNs('GPUBufferUsage', Object.freeze({ MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128, INDIRECT: 256, QUERY_RESOLVE: 512 }));
+  _defNs('GPUColorWrite', Object.freeze({ RED: 1, GREEN: 2, BLUE: 4, ALPHA: 8, ALL: 15 }));
+  _defNs('GPUMapMode', Object.freeze({ READ: 1, WRITE: 2 }));
+  _defNs('GPUShaderStage', Object.freeze({ VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 }));
+  _defNs('GPUTextureUsage', Object.freeze({ COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16 }));
+  _defNs('WGSLLanguageFeatures', Object.freeze(new Set()));
+
+  // --- Interface identity for objects bootstrap already creates ---
+  var _Location = _defClass('Location');
+  try { Object.setPrototypeOf(_locationObj, _Location.prototype); } catch (_e) {}
+  var _DOMStringList = G.DOMStringList;
+  Object.defineProperty(_DOMStringList.prototype, 'length', { get: function() { return this._v ? this._v.length : 0; }, enumerable: true, configurable: true });
+  _DOMStringList.prototype.item = function(i) { return this._v && i < this._v.length ? this._v[i] : null; };
+  _DOMStringList.prototype.contains = function(s) { return !!(this._v && this._v.indexOf(s) >= 0); };
+  Object.defineProperty(_Location.prototype, 'ancestorOrigins', {
+    get: _fn('get ancestorOrigins', function() {
+      var l = _inst(_DOMStringList);
+      l._v = [];
+      return l;
+    }),
+    enumerable: true, configurable: true,
+  });
+  _defClass('HTMLDocument', G.Document || Object);
+  if (navigator.userAgentData && G.NavigatorUAData) {
+    try { Object.setPrototypeOf(navigator.userAgentData, G.NavigatorUAData.prototype); } catch (_e) {}
+  }
+  if (G.navigation && G.Navigation) {
+    try { Object.setPrototypeOf(G.navigation, G.Navigation.prototype); } catch (_e) {}
+  }
+  try { Object.defineProperty(Screen.prototype, Symbol.toStringTag, { value: 'Screen', configurable: true }); } catch (_e) {}
+  try { Object.defineProperty(NetworkInformation.prototype, Symbol.toStringTag, { value: 'NetworkInformation', configurable: true }); } catch (_e) {}
+  try { Object.defineProperty(G, Symbol.toStringTag, { value: 'Window', configurable: true }); } catch (_e) {}
+  // navigator.* member objects get their interface prototypes too.
+  var _navMemberProtos = {
+    credentials: 'CredentialsContainer', locks: 'LockManager', mediaSession: 'MediaSession',
+    wakeLock: 'WakeLock', keyboard: 'Keyboard', mediaCapabilities: 'MediaCapabilities',
+    xr: 'XRSystem', gpu: 'GPU', hid: 'HID', serial: 'Serial', usb: 'USB',
+    devicePosture: 'DevicePosture', virtualKeyboard: 'VirtualKeyboard',
+    windowControlsOverlay: 'WindowControlsOverlay', userActivation: 'UserActivation',
+    storageBuckets: 'StorageBucketManager', scheduling: 'Scheduling', ink: 'Ink',
+    login: 'NavigatorLogin', managed: 'NavigatorManagedData', presentation: 'Presentation',
+    protectedAudience: 'ProtectedAudience', geolocation: 'Geolocation',
+    clipboard: 'Clipboard', storage: 'StorageManager', mediaDevices: 'MediaDevices',
+    serviceWorker: 'ServiceWorkerContainer', trustedTypes: 'TrustedTypePolicyFactory',
+  };
+  if (!navigator.trustedTypes) {
+    try {
+      navigator.trustedTypes = _inst(G.TrustedTypePolicyFactory);
+      navigator.trustedTypes.defaultPolicy = null;
+      navigator.trustedTypes.emptyHTML = '';
+      navigator.trustedTypes.emptyScript = '';
+    } catch (_e) {}
+  }
+  for (const _pk in _navMemberProtos) {
+    var _pc = G[_navMemberProtos[_pk]];
+    if (_pc && navigator[_pk] && typeof navigator[_pk] === 'object') {
+      try { Object.setPrototypeOf(navigator[_pk], _pc.prototype); } catch (_e) {}
+    }
+  }
+
+  // --- Window properties ---
+  var _BarProp = _defClass('BarProp');
+  _getter(_BarProp.prototype, 'visible', true);
+  'locationbar menubar personalbar scrollbars statusbar toolbar'.split(' ').forEach(function(n) {
+    if (G[n] === undefined) G[n] = _inst(_BarProp);
+  });
+  var _External = G.External;
+  _External.prototype.AddSearchProvider = function() {};
+  _External.prototype.IsSearchProviderInstalled = function() { return 0; };
+  if (G.external === undefined) G.external = _inst(_External);
+  Object.defineProperty(G, 'isSecureContext', {
+    get: _fn('get isSecureContext', function() {
+      try {
+        var p = String(G.location.protocol);
+        if (p === 'https:' || p === 'wss:' || p === 'file:') return true;
+        var h = String(G.location.hostname);
+        return h === 'localhost' || h === '::1' || h === '[::1]' || /^127\./.test(h);
+      } catch (_e) { return false; }
+    }),
+    enumerable: true, configurable: true,
+  });
+  if (G.originAgentCluster === undefined) G.originAgentCluster = true;
+  if (G.crossOriginIsolated === undefined) G.crossOriginIsolated = false;
+  if (G.credentialless === undefined) G.credentialless = false;
+  if (G.offscreenBuffering === undefined) G.offscreenBuffering = true;
+  if (G.status === undefined) G.status = '';
+  if (G.clientInformation === undefined) {
+    Object.defineProperty(G, 'clientInformation', {
+      get: _fn('get clientInformation', function() { return navigator; }),
+      enumerable: true, configurable: true,
+    });
+  }
+  G.find = _fn('find', function() { return false; });
+  G.moveTo = _fn('moveTo', function() {});
+  G.moveBy = _fn('moveBy', function() {});
+  G.resizeTo = _fn('resizeTo', function() {});
+  G.resizeBy = _fn('resizeBy', function() {});
+  G.captureEvents = _fn('captureEvents', function() {});
+  G.releaseEvents = _fn('releaseEvents', function() {});
+  G.fetchLater = _fn('fetchLater', function() { return { activated: false }; });
+  G.showOpenFilePicker = _fn('showOpenFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.showSaveFilePicker = _fn('showSaveFilePicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.showDirectoryPicker = _fn('showDirectoryPicker', function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); });
+  G.queryLocalFonts = _fn('queryLocalFonts', function() { return Promise.resolve([]); });
+  G.getScreenDetails = _fn('getScreenDetails', function() {
+    var d = _inst(G.ScreenDetails);
+    var s = _inst(G.ScreenDetailed);
+    var scr = G.screen;
+    if (scr) for (const k of ['availWidth', 'availHeight', 'width', 'height', 'colorDepth', 'pixelDepth']) {
+      try { s[k] = scr[k]; } catch (_e) {}
+    }
+    s.availTop = 0; s.availLeft = 0; s.left = 0; s.top = 0;
+    s.isPrimary = true; s.isInternal = true;
+    s.devicePixelRatio = G.devicePixelRatio || 1;
+    d.screens = [s]; d.currentScreen = s;
+    return Promise.resolve(d);
+  });
+  if (G.viewport === undefined && G.Viewport) G.viewport = _inst(G.Viewport);
+  G.styleMedia = {
+    type: 'screen',
+    matchMedium: _fn('matchMedium', function(q) { try { return matchMedia(q).matches; } catch (_e) { return false; } }),
+  };
+  var _LaunchQueue = G.LaunchQueue;
+  _LaunchQueue.prototype.setConsumer = function() {};
+  if (G.launchQueue === undefined) G.launchQueue = _inst(_LaunchQueue);
+  var _DPIP = _defClass('DocumentPictureInPicture');
+  _getter(_DPIP.prototype, 'window', null);
+  _DPIP.prototype.requestWindow = function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
+  _DPIP.prototype.addEventListener = function() {};
+  _DPIP.prototype.removeEventListener = function() {};
+  if (G.documentPictureInPicture === undefined) G.documentPictureInPicture = _inst(_DPIP);
+  var _Fence = G.Fence;
+  _Fence.prototype.reportEvent = function() {};
+  _Fence.prototype.setReportEventDataForAutomaticBeacons = function() {};
+  if (G.fence === undefined) G.fence = _inst(_Fence);
+  var _SharedStorage = G.SharedStorage;
+  'set append delete clear'.split(' ').forEach(function(m) { _SharedStorage.prototype[m] = function() { return Promise.resolve(); }; });
+  _SharedStorage.prototype.run = function() { return Promise.resolve(null); };
+  _SharedStorage.prototype.selectURL = function() { return Promise.resolve(null); };
+  if (G.sharedStorage === undefined) {
+    var _ss = _inst(_SharedStorage);
+    _ss.worklet = null;
+    G.sharedStorage = _ss;
+  }
+  // webkit-prefixed aliases desktop Chrome still ships.
+  if (G.URL && G.webkitURL === undefined) G.webkitURL = G.URL;
+  if (G.MediaStream && G.webkitMediaStream === undefined) G.webkitMediaStream = G.MediaStream;
+  if (G.RTCPeerConnection && G.webkitRTCPeerConnection === undefined) G.webkitRTCPeerConnection = G.RTCPeerConnection;
+  if (G.webkitRequestAnimationFrame === undefined) G.webkitRequestAnimationFrame = G.requestAnimationFrame;
+  if (G.webkitCancelAnimationFrame === undefined) G.webkitCancelAnimationFrame = G.cancelAnimationFrame;
+  G.webkitRequestFileSystem = _fn('webkitRequestFileSystem', function() {});
+  G.webkitResolveLocalFileSystemURL = _fn('webkitResolveLocalFileSystemURL', function() {});
+  _defClass('webkitSpeechRecognition', G.SpeechRecognition || undefined);
+  _defClass('webkitSpeechRecognitionError', _Event);
+  _defClass('webkitSpeechRecognitionEvent', _Event);
+  if (G.webkitSpeechGrammarList === undefined) G.webkitSpeechGrammarList = G.SpeechGrammarList;
+  if (G.webkitSpeechGrammar === undefined) G.webkitSpeechGrammar = G.SpeechGrammar;
+
+  // --- Permissions ---
+  var _PermissionStatus = _defClass('PermissionStatus');
+  var _Permissions = _defClass('Permissions');
+  Object.defineProperty(_PermissionStatus.prototype, 'name', { get: function() { return this._name; }, enumerable: true, configurable: true });
+  Object.defineProperty(_PermissionStatus.prototype, 'state', { get: function() { return this._state; }, enumerable: true, configurable: true });
+  _PermissionStatus.prototype.onchange = null;
+  _PermissionStatus.prototype.addEventListener = function() {};
+  _PermissionStatus.prototype.removeEventListener = function() {};
+  var _PERMISSION_STATES = {
+    'notifications': function() { return G.Notification && Notification.permission === 'granted' ? 'granted' : 'prompt'; },
+    'geolocation': 'prompt', 'camera': 'prompt', 'microphone': 'prompt', 'midi': 'prompt',
+    'clipboard-read': 'prompt', 'clipboard-write': 'granted', 'persistent-storage': 'granted',
+    'background-sync': 'granted', 'accelerometer': 'granted', 'gyroscope': 'granted',
+    'magnetometer': 'granted', 'ambient-light-sensor': 'granted', 'screen-wake-lock': 'granted',
+    'web-share': 'granted',
+    'speaker-selection': 'prompt', 'local-fonts': 'prompt', 'display-capture': 'prompt',
+    'window-management': 'prompt', 'idle-detection': 'prompt', 'storage-access': 'prompt',
+    'top-level-storage-access': 'prompt', 'payment-handler': 'prompt',
+    'periodic-background-sync': 'prompt', 'keyboard-lock': 'prompt', 'pointer-lock': 'prompt',
+    'nfc': 'prompt', 'bluetooth': 'prompt', 'usb': 'prompt', 'serial': 'prompt',
+    'hid': 'prompt', 'captured-surface-control': 'prompt', 'compute-pressure': 'prompt',
+  };
+  _Permissions.prototype.query = function(desc) {
+    var name = desc && desc.name;
+    return new Promise(function(resolve, reject) {
+      if (!Object.prototype.hasOwnProperty.call(_PERMISSION_STATES, name)) {
+        reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '" + name + "' is not a valid enum value of type PermissionName."));
+        return;
+      }
+      var st = _PERMISSION_STATES[name];
+      var s = _inst(_PermissionStatus);
+      s._name = name;
+      s._state = typeof st === 'function' ? st() : st;
+      resolve(s);
+    });
+  };
+  try { Object.defineProperty(Navigator.prototype, 'permissions', { value: _inst(_Permissions), enumerable: true, configurable: true }); } catch (_e) {}
+
+  // --- WebAuthn surface (Google sign-in probes PublicKeyCredential) ---
+  var _PKC = _defClass('PublicKeyCredential', _Credential);
+  _PKC.isUserVerifyingPlatformAuthenticatorAvailable = function() { return Promise.resolve(true); };
+  _PKC.isConditionalMediationAvailable = function() { return Promise.resolve(true); };
+  _PKC.isExternalCTAP2SecurityKeySupported = function() { return Promise.resolve(true); };
+  _PKC.getClientCapabilities = function() {
+    return Promise.resolve({
+      conditionalCreate: false, conditionalGet: true, hybridTransport: true,
+      passkeyPlatformAuthenticator: true, relatedOrigins: false,
+      signalAllAcceptedCredentials: false, signalCurrentUserDetails: false,
+      signalUnknownCredential: false,
+    });
+  };
+  'signalAllAcceptedCredentials signalCurrentUserDetails signalUnknownCredential'.split(' ').forEach(function(m) {
+    _PKC[m] = function() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); };
+  });
+
+  // --- CacheStorage ---
+  var _Cache = _defClass('Cache');
+  var _CacheStorage = _defClass('CacheStorage');
+  var _cacheStores = new Map();
+  function _cacheKey(req) {
+    if (typeof req === 'string') return req;
+    if (req && typeof req.url === 'string') return req.url;
+    return String(req);
+  }
+  _Cache.prototype.match = function(request) {
+    var e = this._entries.get(_cacheKey(request));
+    return Promise.resolve(e ? e.response : undefined);
+  };
+  _Cache.prototype.matchAll = function(request) {
+    if (request === undefined) return Promise.resolve(Array.from(this._entries.values(), function(e) { return e.response; }));
+    var e = this._entries.get(_cacheKey(request));
+    return Promise.resolve(e ? [e.response] : []);
+  };
+  _Cache.prototype.add = function(request) {
+    var self = this;
+    return Promise.resolve(fetch(request)).then(function(res) {
+      self._entries.set(_cacheKey(request), { request: request, response: res });
+    });
+  };
+  _Cache.prototype.addAll = function(requests) {
+    var self = this;
+    return Promise.all(requests.map(function(r) { return self.add(r); }));
+  };
+  _Cache.prototype.put = function(request, response) {
+    this._entries.set(_cacheKey(request), { request: request, response: response });
+    return Promise.resolve();
+  };
+  _Cache.prototype.delete = function(request) {
+    return Promise.resolve(this._entries.delete(_cacheKey(request)));
+  };
+  _Cache.prototype.keys = function() {
+    return Promise.resolve(Array.from(this._entries.values(), function(e) { return e.request; }));
+  };
+  _CacheStorage.prototype.has = function(name) { return Promise.resolve(_cacheStores.has(String(name))); };
+  _CacheStorage.prototype.keys = function() { return Promise.resolve(Array.from(_cacheStores.keys())); };
+  _CacheStorage.prototype.open = function(name) {
+    name = String(name);
+    if (!_cacheStores.has(name)) _cacheStores.set(name, Object.assign(_inst(_Cache), { _entries: new Map() }));
+    return Promise.resolve(_cacheStores.get(name));
+  };
+  _CacheStorage.prototype.delete = function(name) { return Promise.resolve(_cacheStores.delete(String(name))); };
+  _CacheStorage.prototype.match = function(request) {
+    var key = _cacheKey(request);
+    for (const c of _cacheStores.values()) {
+      var e = c._entries.get(key);
+      if (e) return Promise.resolve(e.response);
+    }
+    return Promise.resolve(undefined);
+  };
+  if (G.caches === undefined) G.caches = _inst(_CacheStorage);
+
+  // --- CookieStore backed by document.cookie ---
+  var _CookieStore = _defClass('CookieStore');
+  _defClass('CookieStoreManager');
+  function _cookieEntries() {
+    var out = []; var raw = '';
+    try { raw = (G.document && G.document.cookie) || ''; } catch (_e) {}
+    for (const part of raw.split(';')) {
+      var idx = part.indexOf('=');
+      if (idx < 0) continue;
+      var name = part.slice(0, idx).trim();
+      if (name) out.push({ name: name, value: part.slice(idx + 1).trim() });
+    }
+    return out;
+  }
+  _CookieStore.prototype.get = function(name) {
+    if (name && typeof name === 'object') name = name.name;
+    var found = _cookieEntries().find(function(c) { return c.name === name; });
+    return Promise.resolve(found || null);
+  };
+  _CookieStore.prototype.getAll = function(name) {
+    var all = _cookieEntries();
+    if (name && typeof name === 'object') name = name.name;
+    if (name) all = all.filter(function(c) { return c.name === name; });
+    return Promise.resolve(all);
+  };
+  _CookieStore.prototype.set = function(opts) {
+    if (!opts || !opts.name) return Promise.reject(new TypeError('name is required'));
+    var s = String(opts.name) + '=' + (opts.value === undefined ? '' : String(opts.value)) + '; path=' + (opts.path || '/');
+    if (opts.expires) s += '; expires=' + new Date(opts.expires).toUTCString();
+    if (opts.sameSite) s += '; SameSite=' + opts.sameSite;
+    G.document.cookie = s;
+    return Promise.resolve();
+  };
+  _CookieStore.prototype.delete = function(name) {
+    if (name && typeof name === 'object') name = name.name;
+    G.document.cookie = String(name) + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+    return Promise.resolve();
+  };
+  _CookieStore.prototype.addEventListener = function() {};
+  _CookieStore.prototype.removeEventListener = function() {};
+  _CookieStore.prototype.onchange = null;
+  if (G.cookieStore === undefined) G.cookieStore = _inst(_CookieStore);
+
+  // --- Trusted Types ---
+  var _TrustedHTML = G.TrustedHTML;
+  var _TrustedScript = G.TrustedScript;
+  var _TrustedScriptURL = G.TrustedScriptURL;
+  var _TTP = G.TrustedTypePolicy;
+  var _TTPF = G.TrustedTypePolicyFactory;
+  function _mkTrusted(cls, s) {
+    var o = _inst(cls);
+    o._v = String(s);
+    o.toString = function() { return this._v; };
+    return o;
+  }
+  _TTP.prototype.createHTML = function(s) { return _mkTrusted(_TrustedHTML, this._rules && this._rules.createHTML ? this._rules.createHTML(s) : s); };
+  _TTP.prototype.createScript = function(s) { return _mkTrusted(_TrustedScript, this._rules && this._rules.createScript ? this._rules.createScript(s) : s); };
+  _TTP.prototype.createScriptURL = function(s) { return _mkTrusted(_TrustedScriptURL, this._rules && this._rules.createScriptURL ? this._rules.createScriptURL(s) : s); };
+  _TTPF.prototype.createPolicy = function(name, rules) {
+    var p = _inst(_TTP);
+    p._rules = rules || {};
+    try { Object.defineProperty(p, 'name', { value: String(name), enumerable: true }); } catch (_e) { p.name = String(name); }
+    return p;
+  };
+  _TTPF.prototype.isHTML = function(v) { return v instanceof _TrustedHTML; };
+  _TTPF.prototype.isScript = function(v) { return v instanceof _TrustedScript; };
+  _TTPF.prototype.isScriptURL = function(v) { return v instanceof _TrustedScriptURL; };
+  _getter(_TTPF.prototype, 'defaultPolicy', null);
+  if (G.trustedTypes === undefined) {
+    var _ttp = _inst(_TTPF);
+    _ttp.emptyHTML = _mkTrusted(_TrustedHTML, '');
+    _ttp.emptyScript = _mkTrusted(_TrustedScript, '');
+    _ttp.emptyScriptURL = _mkTrusted(_TrustedScriptURL, '');
+    G.trustedTypes = _ttp;
+  }
+
+  // --- CompressionStream / DecompressionStream via the Rust codec op ---
+  function _u8ToB64(u8) {
+    var s = '';
+    for (var i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+    return btoa(s);
+  }
+  function _b64ToU8(b64) {
+    var s = atob(b64); var u8 = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+    return u8;
+  }
+  function _compressionClass(direction) {
+    var base = G.TransformStream || Object;
+    return class extends base {
+      constructor(format) {
+        if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
+          throw new TypeError("Failed to construct '" + (direction === 'compress' ? 'CompressionStream' : 'DecompressionStream') + "': Unsupported compression format: '" + format + "'");
+        }
+        var chunks = [];
+        super({
+          transform: function(chunk) {
+            try { chunks.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)); }
+            catch (_e) { chunks.push(new Uint8Array(0)); }
+          },
+          flush: function(controller) {
+            var total = 0;
+            for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+            var all = new Uint8Array(total); var off = 0;
+            for (var j = 0; j < chunks.length; j++) { all.set(chunks[j], off); off += chunks[j].length; }
+            var out = __obscuraCore.ops.op_compress(direction, format, _u8ToB64(all));
+            controller.enqueue(_b64ToU8(out));
+          },
+        });
+      }
+    };
+  }
+  if (typeof G.CompressionStream !== 'function') G.CompressionStream = _compressionClass('compress');
+  if (typeof G.DecompressionStream !== 'function') G.DecompressionStream = _compressionClass('decompress');
+  try { Object.defineProperty(CompressionStream, 'name', { value: 'CompressionStream', configurable: true }); } catch (_e) {}
+  try { Object.defineProperty(DecompressionStream, 'name', { value: 'DecompressionStream', configurable: true }); } catch (_e) {}
+  var _BLQS = _defClass('ByteLengthQueuingStrategy');
+  _BLQS.prototype.size = function(chunk) { return chunk && chunk.byteLength !== undefined ? chunk.byteLength : 0; };
+  var _CQS = _defClass('CountQueuingStrategy');
+  _CQS.prototype.size = function() { return 1; };
+
+  // --- document.all ---
+  // Chrome's all-collection is an undetectable live object: typeof reports
+  // 'undefined', `== null` is true, yet indexed/named element lookup works.
+  // op_document_all builds that object from a V8 undetectable template and
+  // forwards element lookups to the per-document resolver; misses decline so
+  // the prototype below supplies length/item/namedItem/tags.
+  var _HTMLAllCollection = _defClass('HTMLAllCollection');
+  Object.defineProperty(_HTMLAllCollection.prototype, 'length', {
+    get: function() { try { return this._doc ? this._doc.getElementsByTagName('*').length : 0; } catch (_e) { return 0; } },
+    enumerable: true, configurable: true,
+  });
+  _HTMLAllCollection.prototype.item = function(i) {
+    try { return (this._doc && this._doc.getElementsByTagName('*')[i]) || null; } catch (_e) { return null; }
+  };
+  _HTMLAllCollection.prototype.namedItem = function(name) {
+    try {
+      var els = this._doc ? this._doc.getElementsByTagName('*') : [];
+      for (var i = 0; i < els.length; i++) { if (els[i].id === name || els[i].name === name) return els[i]; }
+    } catch (_e) {}
+    return null;
+  };
+  _HTMLAllCollection.prototype.tags = function() { return this; };
+  var _documentAllMap = new WeakMap();
+  function _documentAllFor(doc) {
+    var c = _documentAllMap.get(doc);
+    if (!c) {
+      var created;
+      try {
+        created = __obscuraCore.ops.op_document_all(function(key) {
+          try {
+            var els = doc.getElementsByTagName('*');
+            if (typeof key === 'number') return els[key];
+            if (typeof key !== 'string' || key === '') return undefined;
+            for (var i = 0; i < els.length; i++) { var e = els[i]; if (e.id === key || e.name === key) return e; }
+          } catch (_e) {}
+          return undefined;
+        });
+      } catch (_e) {}
+      if (created === undefined || created === null) {
+        c = _inst(_HTMLAllCollection);
+      } else {
+        c = created;
+        Object.setPrototypeOf(c, _HTMLAllCollection.prototype);
+      }
+      c._doc = doc;
+      _documentAllMap.set(doc, c);
+    }
+    return c;
+  }
+  if (G.Document) {
+    Object.defineProperty(Document.prototype, 'all', {
+      get: _fn('get all', function() { return _documentAllFor(this); }),
+      enumerable: true, configurable: true,
+    });
+  }
+
+  // --- Document fullscreen/PiP/pointer-lock flags ---
+  if (G.Document) {
+    _getter(Document.prototype, 'fullscreenEnabled', true);
+    _getter(Document.prototype, 'webkitFullscreenEnabled', true);
+    _getter(Document.prototype, 'fullscreenElement', null);
+    _getter(Document.prototype, 'webkitFullscreenElement', null);
+    _getter(Document.prototype, 'webkitCurrentFullScreenElement', null);
+    _getter(Document.prototype, 'fullscreen', false);
+    _getter(Document.prototype, 'webkitIsFullScreen', false);
+    _getter(Document.prototype, 'pictureInPictureEnabled', true);
+    _getter(Document.prototype, 'pictureInPictureElement', null);
+    _getter(Document.prototype, 'pointerLockElement', null);
+    Document.prototype.exitFullscreen = function() { return Promise.resolve(); };
+    Document.prototype.webkitExitFullscreen = function() { return Promise.resolve(); };
+    Document.prototype.exitPointerLock = function() {};
+    Document.prototype.exitPictureInPicture = function() { return Promise.resolve(); };
+    if (G.Element) {
+      Element.prototype.requestFullscreen = function() { return Promise.reject(new DOMException('Fullscreen is not supported', 'NotSupportedError')); };
+      Element.prototype.webkitRequestFullscreen = Element.prototype.requestFullscreen;
+    }
+    // Remaining document members desktop Chrome carries.
+    Object.defineProperty(Document.prototype, 'designMode', {
+      get: _fn('get designMode', function() { return this._designMode || 'off'; }),
+      set: _fn('set designMode', function(v) { this._designMode = String(v); }),
+      enumerable: true, configurable: true,
+    });
+    _getter(Document.prototype, 'prerendering', false);
+    _getter(Document.prototype, 'wasDiscarded', false);
+    _getter(Document.prototype, 'xmlVersion', null);
+    Object.defineProperty(Document.prototype, 'featurePolicy', {
+      get: _fn('get featurePolicy', function() {
+        var fp = _inst(G.FeaturePolicy);
+        fp.allowedFeatures = _fn('allowedFeatures', function() {
+          return 'geolocation ch-ua-full-version-list cross-origin-isolated screen-wake-lock on-device-speech-recognition'.split(' ');
+        });
+        fp.allowsFeature = _fn('allowsFeature', function() { return false; });
+        fp.getAllowlistForFeature = _fn('getAllowlistForFeature', function() { return []; });
+        return fp;
+      }),
+      enumerable: true, configurable: true,
+    });
+    Document.prototype.hasStorageAccess = function hasStorageAccess() { return Promise.resolve(false); };
+    Document.prototype.requestStorageAccess = function requestStorageAccess() { return Promise.resolve(); };
+    Document.prototype.startViewTransition = function startViewTransition() {
+      var t = _inst(G.ViewTransition);
+      t.ready = Promise.resolve(); t.finished = Promise.resolve();
+      t.updateCallbackDone = Promise.resolve();
+      t.skipTransition = function() {};
+      return t;
+    };
+    Document.prototype.createExpression = function createExpression(expr, resolver) {
+      var e = _inst(G.XPathExpression);
+      e.evaluate = function() { return _inst(G.XPathResult || Object); };
+      return e;
+    };
+    Object.defineProperty(Document.prototype, 'lastModified', {
+      // Chrome falls back to the load time when no Last-Modified header.
+      get: _fn('get lastModified', function() {
+        var d = new Date();
+        function p(n) { return (n < 10 ? '0' : '') + n; }
+        return p(d.getUTCMonth() + 1) + '/' + p(d.getUTCDate()) + '/' + d.getUTCFullYear() +
+          ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds());
+      }),
+      enumerable: true, configurable: true,
+    });
+    'anchors applets embeds links images forms'.split(' ').forEach(function(coll) {
+      if (!(coll in Document.prototype)) {
+        Object.defineProperty(Document.prototype, coll, {
+          get: _fn('get ' + coll, function() {
+            var els = [];
+            try { els = this.getElementsByTagName(coll === 'anchors' || coll === 'links' ? 'a' : coll === 'images' ? 'img' : coll === 'applets' ? 'applet' : coll === 'embeds' ? 'embed' : 'form'); } catch (_e) {}
+            return els;
+          }),
+          enumerable: true, configurable: true,
+        });
+      }
+    });
+  }
+
+  // CSS namespace extras Chrome exposes.
+  if (G.CSS) {
+    try { CSS.highlights = G.HighlightRegistry ? _inst(G.HighlightRegistry) : new Map(); } catch (_e) {}
+    CSS.paintWorklet = { addModule: function() { return Promise.reject(new DOMException('Worklets are not supported', 'NotSupportedError')); } };
+    CSS.registerProperty = function() {};
+    CSS.supports = CSS.supports || function() { return false; };
+  }
+  if (G.StorageManager) {
+    StorageManager.prototype.estimate = StorageManager.prototype.estimate || function() { return Promise.resolve({ quota: 0, usage: 0 }); };
+    StorageManager.prototype.persist = StorageManager.prototype.persist || function() { return Promise.resolve(false); };
+    StorageManager.prototype.persisted = StorageManager.prototype.persisted || function() { return Promise.resolve(false); };
+    StorageManager.prototype.getDirectory = StorageManager.prototype.getDirectory || function() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); };
+  }
+
+  // --- WebGL capability surface (stealth only) ---
+  // Real Chrome always answers a WebGL context (SwiftShader); a null context
+  // is a classic headless tell. Stealth pages get a context whose constants
+  // and extension shape match a desktop Chrome; non-stealth keeps the
+  // deliberate null from getContext.
+  var _glConsts = {
+    DEPTH_BUFFER_BIT:0x0100,STENCIL_BUFFER_BIT:0x0400,COLOR_BUFFER_BIT:0x4000,
+    POINTS:0,LINES:1,LINE_LOOP:2,LINE_STRIP:3,TRIANGLES:4,TRIANGLE_STRIP:5,TRIANGLE_FAN:6,
+    ZERO:0,ONE:1,SRC_COLOR:0x0300,ONE_MINUS_SRC_COLOR:0x0301,SRC_ALPHA:0x0302,ONE_MINUS_SRC_ALPHA:0x0303,
+    DST_ALPHA:0x0304,ONE_MINUS_DST_ALPHA:0x0305,DST_COLOR:0x0306,ONE_MINUS_DST_COLOR:0x0307,SRC_ALPHA_SATURATE:0x0308,
+    FUNC_ADD:0x8006,BLEND_EQUATION:0x8009,BLEND_EQUATION_RGB:0x8009,BLEND_EQUATION_ALPHA:0x883D,
+    FUNC_SUBTRACT:0x800A,FUNC_REVERSE_SUBTRACT:0x800B,BLEND_DST_RGB:0x80C8,BLEND_SRC_RGB:0x80C9,
+    BLEND_DST_ALPHA:0x80CA,BLEND_SRC_ALPHA:0x80CB,CONSTANT_COLOR:0x8001,ONE_MINUS_CONSTANT_COLOR:0x8002,
+    CONSTANT_ALPHA:0x8003,ONE_MINUS_CONSTANT_ALPHA:0x8004,BLEND_COLOR:0x8005,
+    ARRAY_BUFFER:0x8892,ELEMENT_ARRAY_BUFFER:0x8893,ARRAY_BUFFER_BINDING:0x8894,ELEMENT_ARRAY_BUFFER_BINDING:0x8895,
+    STREAM_DRAW:0x88E0,STATIC_DRAW:0x88E4,DYNAMIC_DRAW:0x88E8,BUFFER_SIZE:0x8764,BUFFER_USAGE:0x8765,
+    CURRENT_VERTEX_ATTRIB:0x8626,FRONT:0x0404,BACK:0x0405,FRONT_AND_BACK:0x0408,
+    CULL_FACE:0x0B44,BLEND:0x0BE2,DITHER:0x0BD0,STENCIL_TEST:0x0B90,DEPTH_TEST:0x0B71,
+    SCISSOR_TEST:0x0C11,POLYGON_OFFSET_FILL:0x8037,SAMPLE_ALPHA_TO_COVERAGE:0x809E,SAMPLE_COVERAGE:0x80A0,
+    NO_ERROR:0,INVALID_ENUM:0x0500,INVALID_VALUE:0x0501,INVALID_OPERATION:0x0502,OUT_OF_MEMORY:0x0505,
+    CW:0x0900,CCW:0x0901,LINE_WIDTH:0x0B21,ALIASED_POINT_SIZE_RANGE:0x846D,ALIASED_LINE_WIDTH_RANGE:0x846E,
+    CULL_FACE_MODE:0x0B45,FRONT_FACE:0x0B46,DEPTH_RANGE:0x0B70,DEPTH_WRITEMASK:0x0B72,DEPTH_CLEAR_VALUE:0x0B73,
+    DEPTH_FUNC:0x0B74,STENCIL_CLEAR_VALUE:0x0B91,STENCIL_FUNC:0x0B92,STENCIL_FAIL:0x0B94,
+    STENCIL_PASS_DEPTH_FAIL:0x0B95,STENCIL_PASS_DEPTH_PASS:0x0B96,STENCIL_REF:0x0B97,STENCIL_VALUE_MASK:0x0B93,
+    STENCIL_WRITEMASK:0x0B98,STENCIL_BACK_FUNC:0x8800,STENCIL_BACK_FAIL:0x8801,STENCIL_BACK_PASS_DEPTH_FAIL:0x8802,
+    STENCIL_BACK_PASS_DEPTH_PASS:0x8803,STENCIL_BACK_REF:0x8CA3,STENCIL_BACK_VALUE_MASK:0x8CA4,STENCIL_BACK_WRITEMASK:0x8CA5,
+    VIEWPORT:0x0BA2,SCISSOR_BOX:0x0C10,COLOR_CLEAR_VALUE:0x0C22,COLOR_WRITEMASK:0x0C23,
+    UNPACK_ALIGNMENT:0x0CF5,PACK_ALIGNMENT:0x0D05,MAX_TEXTURE_SIZE:0x0D33,MAX_VIEWPORT_DIMS:0x0D3A,
+    SUBPIXEL_BITS:0x0D50,RED_BITS:0x0D52,GREEN_BITS:0x0D53,BLUE_BITS:0x0D54,ALPHA_BITS:0x0D55,
+    DEPTH_BITS:0x0D56,STENCIL_BITS:0x0D57,POLYGON_OFFSET_UNITS:0x2A00,POLYGON_OFFSET_FACTOR:0x8038,
+    TEXTURE_BINDING_2D:0x8069,SAMPLE_BUFFERS:0x80A8,SAMPLES:0x80A9,SAMPLE_COVERAGE_VALUE:0x80AA,
+    SAMPLE_COVERAGE_INVERT:0x80AB,COMPRESSED_TEXTURE_FORMATS:0x86A3,
+    DONT_CARE:0x1100,FASTEST:0x1101,NICEST:0x1102,GENERATE_MIPMAP_HINT:0x8192,
+    BYTE:0x1400,UNSIGNED_BYTE:0x1401,SHORT:0x1402,UNSIGNED_SHORT:0x1403,INT:0x1404,UNSIGNED_INT:0x1405,FLOAT:0x1406,
+    DEPTH_COMPONENT:0x1902,ALPHA:0x1906,RGB:0x1907,RGBA:0x1908,LUMINANCE:0x1909,LUMINANCE_ALPHA:0x190A,
+    UNSIGNED_SHORT_4_4_4_4:0x8033,UNSIGNED_SHORT_5_5_5_1:0x8034,UNSIGNED_SHORT_5_6_5:0x8363,
+    FRAGMENT_SHADER:0x8B30,VERTEX_SHADER:0x8B31,MAX_VERTEX_ATTRIBS:0x8869,MAX_VERTEX_UNIFORM_VECTORS:0x8DFB,
+    MAX_VARYING_VECTORS:0x8DFC,MAX_COMBINED_TEXTURE_IMAGE_UNITS:0x8B4D,MAX_VERTEX_TEXTURE_IMAGE_UNITS:0x8B4C,
+    MAX_TEXTURE_IMAGE_UNITS:0x8872,MAX_FRAGMENT_UNIFORM_VECTORS:0x8DFD,SHADER_TYPE:0x8B4F,DELETE_STATUS:0x8B80,
+    LINK_STATUS:0x8B82,VALIDATE_STATUS:0x8B83,ATTACHED_SHADERS:0x8B85,ACTIVE_UNIFORMS:0x8B86,
+    ACTIVE_ATTRIBUTES:0x8B89,SHADING_LANGUAGE_VERSION:0x8B8C,CURRENT_PROGRAM:0x8B8D,
+    NEVER:0x0200,LESS:0x0201,EQUAL:0x0202,LEQUAL:0x0203,GREATER:0x0204,NOTEQUAL:0x0205,GEQUAL:0x0206,ALWAYS:0x0207,
+    KEEP:0x1E00,REPLACE:0x1E01,INCR:0x1E02,DECR:0x1E03,INVERT:0x150A,INCR_WRAP:0x8507,DECR_WRAP:0x8508,
+    VENDOR:0x1F00,RENDERER:0x1F01,VERSION:0x1F02,
+    NEAREST:0x2600,LINEAR:0x2601,NEAREST_MIPMAP_NEAREST:0x2700,LINEAR_MIPMAP_NEAREST:0x2701,
+    NEAREST_MIPMAP_LINEAR:0x2702,LINEAR_MIPMAP_LINEAR:0x2703,TEXTURE_MAG_FILTER:0x2800,TEXTURE_MIN_FILTER:0x2801,
+    TEXTURE_WRAP_S:0x2802,TEXTURE_WRAP_T:0x2803,TEXTURE_2D:0x0DE1,TEXTURE:0x1702,TEXTURE_CUBE_MAP:0x8513,
+    TEXTURE_BINDING_CUBE_MAP:0x8514,TEXTURE_CUBE_MAP_POSITIVE_X:0x8515,TEXTURE_CUBE_MAP_NEGATIVE_X:0x8516,
+    TEXTURE_CUBE_MAP_POSITIVE_Y:0x8517,TEXTURE_CUBE_MAP_NEGATIVE_Y:0x8518,TEXTURE_CUBE_MAP_POSITIVE_Z:0x8519,
+    TEXTURE_CUBE_MAP_NEGATIVE_Z:0x851A,MAX_CUBE_MAP_TEXTURE_SIZE:0x851C,ACTIVE_TEXTURE:0x84E0,
+    REPEAT:0x2901,CLAMP_TO_EDGE:0x812F,MIRRORED_REPEAT:0x8370,
+    FLOAT_VEC2:0x8B50,FLOAT_VEC3:0x8B51,FLOAT_VEC4:0x8B52,INT_VEC2:0x8B53,INT_VEC3:0x8B54,INT_VEC4:0x8B55,
+    BOOL:0x8B56,BOOL_VEC2:0x8B57,BOOL_VEC3:0x8B58,BOOL_VEC4:0x8B59,FLOAT_MAT2:0x8B5A,FLOAT_MAT3:0x8B5B,
+    FLOAT_MAT4:0x8B5C,SAMPLER_2D:0x8B5E,SAMPLER_CUBE:0x8B60,
+    VERTEX_ATTRIB_ARRAY_ENABLED:0x8622,VERTEX_ATTRIB_ARRAY_SIZE:0x8623,VERTEX_ATTRIB_ARRAY_STRIDE:0x8624,
+    VERTEX_ATTRIB_ARRAY_TYPE:0x8625,VERTEX_ATTRIB_ARRAY_NORMALIZED:0x886A,VERTEX_ATTRIB_ARRAY_POINTER:0x8645,
+    VERTEX_ATTRIB_ARRAY_BUFFER_BINDING:0x889F,COMPILE_STATUS:0x8B81,
+    LOW_FLOAT:0x8DF0,MEDIUM_FLOAT:0x8DF1,HIGH_FLOAT:0x8DF2,LOW_INT:0x8DF3,MEDIUM_INT:0x8DF4,HIGH_INT:0x8DF5,
+    FRAMEBUFFER:0x8D40,RENDERBUFFER:0x8D41,RGBA4:0x8056,RGB5_A1:0x8057,RGB565:0x8D62,
+    DEPTH_COMPONENT16:0x81A5,STENCIL_INDEX:0x1901,STENCIL_INDEX8:0x8D48,DEPTH_STENCIL:0x84F9,
+    RENDERBUFFER_WIDTH:0x8D42,RENDERBUFFER_HEIGHT:0x8D43,RENDERBUFFER_INTERNAL_FORMAT:0x8D44,
+    RENDERBUFFER_RED_SIZE:0x8D50,RENDERBUFFER_GREEN_SIZE:0x8D51,RENDERBUFFER_BLUE_SIZE:0x8D52,
+    RENDERBUFFER_ALPHA_SIZE:0x8D53,RENDERBUFFER_DEPTH_SIZE:0x8D54,RENDERBUFFER_STENCIL_SIZE:0x8D55,
+    FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE:0x8CD0,FRAMEBUFFER_ATTACHMENT_OBJECT_NAME:0x8CD1,
+    FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL:0x8CD2,FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE:0x8CD3,
+    COLOR_ATTACHMENT0:0x8CE0,DEPTH_ATTACHMENT:0x8D00,STENCIL_ATTACHMENT:0x8D20,DEPTH_STENCIL_ATTACHMENT:0x821A,
+    NONE:0,FRAMEBUFFER_COMPLETE:0x8CD5,FRAMEBUFFER_INCOMPLETE_ATTACHMENT:0x8CD6,
+    FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:0x8CD7,FRAMEBUFFER_INCOMPLETE_DIMENSIONS:0x8CD9,
+    FRAMEBUFFER_UNSUPPORTED:0x8CDD,FRAMEBUFFER_BINDING:0x8CA6,RENDERBUFFER_BINDING:0x8CA7,
+    MAX_RENDERBUFFER_SIZE:0x84E8,INVALID_FRAMEBUFFER_OPERATION:0x0506,
+    UNPACK_FLIP_Y_WEBGL:0x9240,UNPACK_PREMULTIPLY_ALPHA_WEBGL:0x9241,CONTEXT_LOST_WEBGL:0x9242,
+    UNPACK_COLORSPACE_CONVERSION_WEBGL:0x9243,BROWSER_DEFAULT_WEBGL:0x9244,
+  };
+  for (var _ti = 0; _ti < 32; _ti++) _glConsts['TEXTURE' + _ti] = 0x84C0 + _ti;
+  var _gl2Consts = {
+    READ_BUFFER:0x0C02,UNPACK_ROW_LENGTH:0x0CF2,UNPACK_SKIP_ROWS:0x0CF3,UNPACK_SKIP_PIXELS:0x0CF4,
+    PACK_ROW_LENGTH:0x0D02,PACK_SKIP_ROWS:0x0D03,PACK_SKIP_PIXELS:0x0D04,TEXTURE_BINDING_3D:0x806A,
+    UNPACK_SKIP_IMAGES:0x806D,UNPACK_IMAGE_HEIGHT:0x806E,MAX_3D_TEXTURE_SIZE:0x8073,
+    MAX_ELEMENTS_VERTICES:0x80E8,MAX_ELEMENTS_INDICES:0x80E9,MAX_TEXTURE_LOD_BIAS:0x84FD,
+    MAX_FRAGMENT_UNIFORM_COMPONENTS:0x8B49,MAX_VERTEX_UNIFORM_COMPONENTS:0x8B4A,MAX_ARRAY_TEXTURE_LAYERS:0x88FF,
+    MIN_PROGRAM_TEXEL_OFFSET:0x8904,MAX_PROGRAM_TEXEL_OFFSET:0x8905,MAX_VARYING_COMPONENTS:0x8B4B,
+    MAX_VERTEX_OUTPUT_COMPONENTS:0x9122,MAX_FRAGMENT_INPUT_COMPONENTS:0x9125,MAX_SERVER_WAIT_TIMEOUT:0x9111,
+    MAX_ELEMENT_INDEX:0x8D6B,RED:0x1903,RG:0x8227,R8:0x8229,RG8:0x822B,R16F:0x822D,R32F:0x822E,
+    RG16F:0x822F,RG32F:0x8230,RGBA32F:0x8814,RGB32F:0x8815,RGBA16F:0x881A,R11F_G11F_B10F:0x8C3A,
+    DEPTH24_STENCIL8:0x88F0,DEPTH32F_STENCIL8:0x8CAD,DEPTH_COMPONENT24:0x81A6,DEPTH_COMPONENT32F:0x8CAC,
+    READ_FRAMEBUFFER:0x8CA8,DRAW_FRAMEBUFFER:0x8CA9,RGBA_INTEGER:0x8D99,RGB_INTEGER:0x8D98,
+    RG_INTEGER:0x8228,RED_INTEGER:0x8D94,INT_SAMPLER_2D:0x8DCA,INT_SAMPLER_3D:0x8DCB,
+    INT_SAMPLER_CUBE:0x8DCC,INT_SAMPLER_2D_ARRAY:0x8DCF,UNSIGNED_INT_SAMPLER_2D:0x8DD2,
+    UNSIGNED_INT_SAMPLER_3D:0x8DD3,UNSIGNED_INT_SAMPLER_CUBE:0x8DD4,UNSIGNED_INT_SAMPLER_2D_ARRAY:0x8DD7,
+    QUERY_RESULT:0x8866,QUERY_RESULT_AVAILABLE:0x8867,SAMPLES_PASSED:0x8914,ANY_SAMPLES_PASSED:0x8C2F,
+    ANY_SAMPLES_PASSED_CONSERVATIVE:0x8D6A,TRANSFORM_FEEDBACK:0x8E22,TRANSFORM_FEEDBACK_PAUSED:0x8E23,
+    TRANSFORM_FEEDBACK_ACTIVE:0x8E24,TRANSFORM_FEEDBACK_BINDING:0x8E25,TRANSFORM_FEEDBACK_BUFFER:0x8C8E,
+    TRANSFORM_FEEDBACK_BUFFER_BINDING:0x8C8F,TRANSFORM_FEEDBACK_BUFFER_SIZE:0x8C85,
+    TRANSFORM_FEEDBACK_BUFFER_START:0x8C84,TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN:0x8C88,
+    RASTERIZER_DISCARD:0x8C89,PRIMITIVES_GENERATED:0x8C87,TRANSFORM_FEEDBACK_VARYINGS:0x8C83,
+    INTERLEAVED_ATTRIBS:0x8C8C,SEPARATE_ATTRIBS:0x8C8D,PIXEL_PACK_BUFFER:0x88EB,PIXEL_UNPACK_BUFFER:0x88EC,
+    PIXEL_PACK_BUFFER_BINDING:0x88ED,PIXEL_UNPACK_BUFFER_BINDING:0x88EF,SRGB:0x8C40,SRGB8:0x8C41,
+    SRGB8_ALPHA8:0x8C43,FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING:0x8210,VERTEX_ARRAY_BINDING:0x85B5,
+    UNIFORM_BUFFER:0x8A11,UNIFORM_BUFFER_BINDING:0x8A28,UNIFORM_BUFFER_START:0x8A29,UNIFORM_BUFFER_SIZE:0x8A2A,
+    MAX_VERTEX_UNIFORM_BLOCKS:0x8A2B,MAX_FRAGMENT_UNIFORM_BLOCKS:0x8A2D,MAX_COMBINED_UNIFORM_BLOCKS:0x8A2E,
+    MAX_UNIFORM_BUFFER_BINDINGS:0x8A2F,MAX_UNIFORM_BLOCK_SIZE:0x8A30,UNIFORM_BLOCK_DATA_SIZE:0x8A40,
+    UNIFORM_BLOCK_NAME_LENGTH:0x8A41,UNIFORM_BLOCK_ACTIVE_UNIFORMS:0x8A42,UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES:0x8A43,
+    UNIFORM_BLOCK_BINDING:0x8A3F,UNIFORM_BLOCK_INDEX:0x8A3A,UNIFORM_OFFSET:0x8A3B,UNIFORM_ARRAY_STRIDE:0x8A3C,
+    UNIFORM_MATRIX_STRIDE:0x8A3D,UNIFORM_IS_ROW_MAJOR:0x8A3E,UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:0x8A44,
+    UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER:0x8A46,UNIFORM_SIZE:0x8A38,UNIFORM_TYPE:0x8A37,
+    UNIFORM_NAME_LENGTH:0x8A39,ACTIVE_UNIFORM_BLOCKS:0x8A36,INVALID_INDEX:0xFFFFFFFF,
+    MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:0x8A31,MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS:0x8A33,
+    COPY_READ_BUFFER:0x8F36,COPY_WRITE_BUFFER:0x8F37,COPY_READ_BUFFER_BINDING:0x8F36,COPY_WRITE_BUFFER_BINDING:0x8F37,
+    TEXTURE_2D_ARRAY:0x8C1A,TEXTURE_BINDING_2D_ARRAY:0x8C1D,TEXTURE_3D:0x806F,MAX_COLOR_ATTACHMENTS:0x8CDF,
+    MAX_DRAW_BUFFERS:0x8824,PROVOKING_VERTEX:0x8E4F,FIRST_VERTEX_CONVENTION:0x8E4D,LAST_VERTEX_CONVENTION:0x8E4E,
+    TEXTURE_IMMUTABLE_FORMAT:0x912F,TEXTURE_IMMUTABLE_LEVELS:0x82DF,SIGNED_NORMALIZED:0x8F9C,
+    FLOAT_32_UNSIGNED_INT_24_8_REV:0x8DAD,UNSIGNED_INT_10F_11F_11F_REV:0x8C3B,UNSIGNED_INT_5_9_9_9_REV:0x8C3E,
+    UNSIGNED_INT_24_8:0x84FA,UNSIGNED_INT_2_10_10_10_REV:0x8368,UNSIGNED_INT_VEC2:0x8DC6,UNSIGNED_INT_VEC3:0x8DC7,
+    UNSIGNED_INT_VEC4:0x8DC8,HALF_FLOAT:0x140B,RGB10_A2:0x8059,RGB9_E5:0x8C3D,COMPARE_REF_TO_TEXTURE:0x884E,
+    TEXTURE_COMPARE_MODE:0x884C,TEXTURE_COMPARE_FUNC:0x884D,CURRENT_QUERY:0x8865,TEXTURE_MAX_LEVEL:0x813D,
+    TEXTURE_BASE_LEVEL:0x813C,TEXTURE_MAX_LOD:0x813B,TEXTURE_MIN_LOD:0x813A,TEXTURE_WRAP_R:0x8072,
+    TEXTURE_SWIZZLE_R:0x8E42,TEXTURE_SWIZZLE_G:0x8E43,TEXTURE_SWIZZLE_B:0x8E44,TEXTURE_SWIZZLE_A:0x8E45,
+    SYNC_GPU_COMMANDS_COMPLETE:0x9117,ALREADY_SIGNALED:0x911A,TIMEOUT_EXPIRED:0x911B,CONDITION_SATISFIED:0x911C,
+    WAIT_FAILED:0x911D,SYNC_STATUS:0x9114,SYNC_FLAGS:0x9115,OBJECT_TYPE:0x9112,SYNC_FENCE:0x9116,
+    SYNC_FLUSH_COMMANDS_BIT:0x00000001,TIMEOUT_IGNORED:-1,STATIC_READ:0x88E5,DYNAMIC_READ:0x88E9,
+    STATIC_COPY:0x88E6,DYNAMIC_COPY:0x88EA,STREAM_READ:0x88E1,STREAM_COPY:0x88E2,
+    VERTEX_ATTRIB_ARRAY_INTEGER:0x88FD,VERTEX_ATTRIB_ARRAY_DIVISOR:0x88FE,DEPTH_CLAMP:0x864F,
+  };
+  for (var _ci = 1; _ci < 16; _ci++) { _gl2Consts['COLOR_ATTACHMENT' + _ci] = 0x8CE0 + _ci; _gl2Consts['DRAW_BUFFER' + _ci] = 0x8825 + _ci; }
+  try { Object.assign(WebGLRenderingContext.prototype, _glConsts); } catch (_e) {}
+  try { Object.setPrototypeOf(WebGL2RenderingContext.prototype, WebGLRenderingContext.prototype); } catch (_e) {}
+  try { Object.assign(WebGL2RenderingContext.prototype, _glConsts, _gl2Consts); } catch (_e) {}
+  var _gl1Exts = [
+    'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float',
+    'EXT_float_blend', 'EXT_frag_depth', 'EXT_shader_texture_lod', 'EXT_sRGB',
+    'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc',
+    'EXT_texture_filter_anisotropic', 'KHR_parallel_shader_compile',
+    'OES_element_index_uint', 'OES_fbo_render_mipmap', 'OES_standard_derivatives',
+    'OES_texture_float', 'OES_texture_float_linear', 'OES_texture_half_float',
+    'OES_texture_half_float_linear', 'OES_vertex_array_object',
+    'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_s3tc',
+    'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
+    'WEBGL_debug_shaders', 'WEBGL_depth_texture', 'WEBGL_draw_buffers',
+    'WEBGL_lose_context', 'WEBGL_multi_draw',
+    'EXT_color_buffer_float', 'EXT_disjoint_timer_query_webgl2',
+    'WEBGL_blend_func_extended', 'WEBGL_clip_control', 'WEBGL_depth_clamp',
+    'WEBGL_provoking_vertex', 'OES_texture_stencil8',
+  ];
+  var _gl2Exts = [
+    'EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'EXT_depth_clamp',
+    'EXT_float_blend', 'EXT_texture_compression_bptc',
+    'EXT_texture_compression_rgtc', 'EXT_texture_filter_anisotropic',
+    'KHR_parallel_shader_compile', 'OES_draw_buffers_indexed',
+    'WEBGL_blend_func_extended', 'WEBGL_clip_control',
+    'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb',
+    'WEBGL_debug_renderer_info', 'WEBGL_debug_shaders', 'WEBGL_depth_clamp',
+    'WEBGL_lose_context', 'WEBGL_multi_draw', 'WEBGL_provoking_vertex',
+  ];
+  var _glExtObjects = {
+    'WEBGL_debug_renderer_info': { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 },
+    'EXT_texture_filter_anisotropic': { TEXTURE_MAX_ANISOTROPY_EXT: 0x84FE, MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF },
+    'WEBGL_lose_context': { loseContext: function() {}, restoreContext: function() {} },
+  };
+  var _gl1Params = {
+    0x1F02: 'WebGL 1.0 (OpenGL ES 2.0 Chromium)',
+    0x8B8C: 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)',
+    0x1F00: 'WebKit', 0x1F01: 'WebKit WebGL',
+    0x9245: 'Google Inc. (Intel)',
+    0x9246: 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    0x0D33: 8192, 0x851C: 8192, 0x84E8: 8192,
+    0x0D3A: new Int32Array([8192, 8192]),
+    0x8869: 16, 0x8DFB: 4096, 0x8DFC: 30, 0x8DFD: 1024,
+    0x8B4C: 16, 0x8872: 16, 0x8B4D: 32,
+    0x846D: new Float32Array([1, 1024]), 0x846E: new Float32Array([1, 1]),
+    0x0D52: 8, 0x0D53: 8, 0x0D54: 8, 0x0D55: 8,
+    0x0D56: 24, 0x0D57: 8, 0x0D50: 4,
+    0x80A8: 1, 0x80A9: 4, 0x84FF: 16, 0x84FD: 2.0,
+    0x8192: 0x1101, 0x8069: 0x84C0,
+    0x0B71: false, 0x0BE2: false, 0x0B45: false, 0x0B44: false,
+    0x0B46: false, 0x0B48: false, 0x0C23: false, 0x0B90: false,
+    0x0B70: true, 0x0D32: 0x0203, 0x0BA2: 0x0405, 0x0B74: 0x0201,
+    0x0B72: 0x0000, 0x0B73: 0x0000,
+    0x0D05: 4, 0x0CF5: 4, 0x9240: false, 0x9241: false, 0x9243: true,
+    0x8DF6: true,
+    0x2A00: 0, 0x8038: 0,
+  };
+  var _gl2Params = Object.assign(Object.create(null), _gl1Params, {
+    0x1F02: 'WebGL 2.0 (OpenGL ES 3.0 Chromium)',
+    0x8B8C: 'WebGL GLSL ES 3.0 (OpenGL ES GLSL ES 3.0.0 Chromium)',
+    0x8073: 2048, 0x88FF: 2048, 0x8CDF: 8, 0x8824: 8,
+    0x8D6B: 4294967295, 0x80E9: 2147483647, 0x80E8: 2147483647,
+    0x9125: 120, 0x8A2D: 24, 0x8A2B: 24, 0x8A2F: 36, 0x8A30: 65536,
+    0x9122: 120, 0x8B4B: 120, 0x8905: 7, 0x8904: -8,
+    0x8D57: 4, 0x9111: 0,
+    0x8C8A: 64, 0x8C8B: 4, 0x8C80: 4,
+    0x8B8D: 3, 0x8E22: 4,
+  });
+  var _glVoidMethods = ('activeTexture attachShader bindAttribLocation bindBuffer bindBufferBase bindBufferRange ' +
+    'bindFramebuffer bindRenderbuffer bindSampler bindTexture bindTransformFeedback bindVertexArray ' +
+    'blendColor blendEquation blendEquationSeparate blendFunc blendFuncSeparate blitFramebuffer ' +
+    'bufferData bufferSubData clear clearBufferfi clearBufferfv clearBufferiv clearBufferuiv clearColor ' +
+    'clearDepth clearStencil colorMask compileShader compressedTexImage2D compressedTexImage3D ' +
+    'compressedTexSubImage2D compressedTexSubImage3D copyBufferSubData copyTexImage2D copyTexSubImage2D ' +
+    'copyTexSubImage3D cullFace deleteBuffer deleteFramebuffer deleteProgram deleteQuery deleteRenderbuffer ' +
+    'deleteSampler deleteShader deleteSync deleteTexture deleteTransformFeedback deleteVertexArray depthFunc ' +
+    'depthMask depthRange detachShader disable disableVertexAttribArray drawArrays drawArraysInstanced ' +
+    'drawBuffers drawElements drawElementsInstanced drawRangeElements enable enableVertexAttribArray ' +
+    'endQuery endTransformFeedback finish flush framebufferRenderbuffer framebufferTexture2D ' +
+    'framebufferTextureLayer frontFace generateMipmap hint invalidateFramebuffer invalidateSubFramebuffer ' +
+    'lineWidth linkProgram pauseTransformFeedback pixelStorei polygonOffset readBuffer ' +
+    'renderbufferStorage renderbufferStorageMultisample resumeTransformFeedback sampleCoverage scissor ' +
+    'shaderSource stencilFunc stencilFuncSeparate stencilMask stencilMaskSeparate stencilOp ' +
+    'stencilOpSeparate texImage2D texImage3D texParameterf texParameteri texStorage2D texStorage3D ' +
+    'texSubImage2D texSubImage3D transformFeedbackVaryings uniform1f uniform1fv uniform1i uniform1iv ' +
+    'uniform1ui uniform1uiv uniform2f uniform2fv uniform2i uniform2iv uniform2ui uniform2uiv uniform3f ' +
+    'uniform3fv uniform3i uniform3iv uniform3ui uniform3uiv uniform4f uniform4fv uniform4i uniform4iv ' +
+    'uniform4ui uniform4uiv uniformBlockBinding uniformMatrix2fv uniformMatrix2x3fv uniformMatrix2x4fv ' +
+    'uniformMatrix3fv uniformMatrix3x2fv uniformMatrix3x4fv uniformMatrix4fv uniformMatrix4x2fv ' +
+    'uniformMatrix4x3fv useProgram validateProgram vertexAttrib1f vertexAttrib1fv vertexAttrib2f ' +
+    'vertexAttrib2fv vertexAttrib3f vertexAttrib3fv vertexAttrib4f vertexAttrib4fv vertexAttribDivisor ' +
+    'vertexAttribI4i vertexAttribI4iv vertexAttribI4ui vertexAttribI4uiv vertexAttribIPointer ' +
+    'vertexAttribPointer viewport waitSync').split(' ');
+  var _glObjectCtors = {
+    createBuffer: 'WebGLBuffer', createFramebuffer: 'WebGLFramebuffer',
+    createProgram: 'WebGLProgram', createRenderbuffer: 'WebGLRenderbuffer',
+    createShader: 'WebGLShader', createTexture: 'WebGLTexture',
+    createQuery: 'WebGLQuery', createSampler: 'WebGLSampler',
+    createTransformFeedback: 'WebGLTransformFeedback', createVertexArray: 'WebGLVertexArrayObject',
+    fenceSync: 'WebGLSync',
+  };
+  var _glNullMethods = ('getAttachedShaders getUniform getUniformIndices getQuery getQueryObject ' +
+    'getSamplerParameter getSyncParameter getTransformFeedbackVarying getInternalformatParameter ' +
+    'getIndexedParameter getBufferParameter getFramebufferAttachmentParameter getProgramParameter ' +
+    'getRenderbufferParameter getShaderParameter getTexParameter getVertexAttrib').split(' ');
+  var _glFalseMethods = ('isBuffer isEnabled isFramebuffer isProgram isQuery isRenderbuffer isSampler ' +
+    'isShader isSync isTexture isTransformFeedback isVertexArray').split(' ');
+  // Real backend: every call forwards to the dlopen'd GLES context created
+  // for this canvas, so reads and rendered pixels are genuine. Falls back to
+  // the pure-JS shim when the host has no GL library.
+  function _installWebGLContext(canvas, v2) {
+    var opCreate = __obscuraCore.ops && __obscuraCore.ops.op_gl_create;
+    var gid = opCreate ? opCreate(
+      Math.max(1, (canvas.width | 0) || 300), Math.max(1, (canvas.height | 0) || 150),
+      v2 ? 1 : 0) : -1;
+    if (gid < 0) return _installWebGLContextShim(canvas, v2);
+    var proto = v2 ? G.WebGL2RenderingContext.prototype : G.WebGLRenderingContext.prototype;
+    var ctx = Object.create(proto);
+    ctx._canvas = canvas;
+    ctx.canvas = canvas;
+    ctx.drawingBufferColorSpace = 'srgb';
+    ctx.unpackColorSpace = 'srgb';
+    Object.assign(ctx, _glConsts);
+    if (v2) Object.assign(ctx, _gl2Consts);
+    var params = v2 ? _gl2Params : _gl1Params;
+    var exts = v2 ? _gl2Exts : _gl1Exts;
+    var _g = function(m, a) {
+      var r = __obscuraCore.ops.op_gl(gid, JSON.stringify({ m: m, a: a || [] }));
+      return r ? JSON.parse(r) : null;
+    };
+    var _o = {};
+    var _mk = function(tag, cls, h) {
+      var o = _inst(G[cls]);
+      o._h = h;
+      _o[tag + h] = o;
+      return o;
+    };
+    var _hid = function(o) { return o ? (o._h | 0) : 0; };
+    var _u8b64 = function(d) {
+      if (d == null) return { b: '' };
+      var u8 = d instanceof ArrayBuffer ? new Uint8Array(d)
+        : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
+        : null;
+      if (!u8) return { b: '' };
+      var str = '';
+      for (var i = 0; i < u8.length; i += 0x8000) {
+        str += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+      }
+      return { b: btoa(str) };
+    };
+    var _arr = function(v) { return Array.isArray(v) ? v : Array.from(v || []); };
+
+    var _VOIDS = ('viewport scissor clearColor blendColor colorMask blendFuncSeparate ' +
+      'stencilOpSeparate stencilFuncSeparate blendEquationSeparate blendFunc hint ' +
+      'polygonOffset depthRange sampleCoverage stencilFunc stencilOp clearDepth ' +
+      'clearStencil clear enable disable cullFace depthFunc depthMask frontFace ' +
+      'lineWidth stencilMask pixelStorei stencilMaskSeparate flush finish ' +
+      'compileShader linkProgram useProgram validateProgram generateMipmap ' +
+      'readBuffer vertexAttribPointer enableVertexAttribArray ' +
+      'disableVertexAttribArray vertexAttribDivisor renderbufferStorage ' +
+      'framebufferRenderbuffer activeTexture texParameteri texParameterf ' +
+      'drawArrays drawElements drawArraysInstanced drawElementsInstanced ' +
+      'attachShader detachShader framebufferTexture2D renderbufferStorage ' +
+      'stencilFunc stencilOp').split(' ');
+    var _fwd = function(name) {
+      ctx[name] = _fn(name, function() {
+        var args = Array.prototype.slice.call(arguments);
+        for (var i = 0; i < args.length; i++) {
+          if (args[i] && typeof args[i] === 'object' && args[i]._h !== undefined) {
+            args[i] = args[i]._h;
+          }
+        }
+        _g(name, args);
+      });
+    };
+    _VOIDS.forEach(_fwd);
+    ctx.bindAttribLocation = _fn('bindAttribLocation', function(p, i, n) {
+      _g('bindAttribLocation', [_hid(p), i, String(n)]);
+    });
+
+    ctx.readPixels = _fn('readPixels', function(x, y, w, h, format, type, pixels) {
+      var r = _g('readPixels', [x, y, w, h, format, type]);
+      if (!r || !r.b || !pixels || typeof pixels.set !== 'function') return;
+      var b = _base64ToUint8Array(r.b);
+      pixels.set(b.length > pixels.length ? b.subarray(0, pixels.length) : b);
+    });
+    ctx.getError = _fn('getError', function() { return _g('getError'); });
+    ctx.isEnabled = _fn('isEnabled', function(c) { return !!_g('isEnabled', [c]); });
+    ctx.getSupportedExtensions = _fn('getSupportedExtensions', function() { return exts.slice(); });
+    ctx.getExtension = _fn('getExtension', function(name) {
+      if (exts.indexOf(name) < 0) return null;
+      if (name === 'ANGLE_instanced_arrays') {
+        return {
+          drawArraysInstancedANGLE: function(m, f, c, i) { _g('drawArraysInstanced', [m, f, c, i]); },
+          drawElementsInstancedANGLE: function(m, c, t, o, i) { _g('drawElementsInstanced', [m, c, t, o, i]); },
+          vertexAttribDivisorANGLE: function(x, d) { _g('vertexAttribDivisor', [x, d]); },
+        };
+      }
+      if (name === 'WEBGL_lose_context') {
+        return { loseContext: function() {}, restoreContext: function() {} };
+      }
+      return _glExtObjects[name] || {};
+    });
+    var _GP_F4 = { 0x0C22: 1, 0x8005: 1 };
+    var _GP_F2 = { 0x0B70: 1, 0x846D: 1, 0x846E: 1 };
+    var _GP_B4 = { 0x0C23: 1 };
+    var _GP_B1 = {
+      0x0B71: 1, 0x0BE2: 1, 0x0B45: 1, 0x0B44: 1, 0x0B46: 1, 0x0B48: 1,
+      0x0B90: 1, 0x0C11: 1, 0x8037: 1, 0x809E: 1, 0x80A0: 1, 0x0B72: 1,
+    };
+    var _GP_I4 = { 0x0C10: 1, 0x0BA2: 1, 0x8878: 1 };
+    var _GP_I2 = { 0x0D3A: 1 };
+    var _GP_OBJ = {
+      0x8894: 'b', 0x8895: 'b', 0x8B8D: 'p', 0x8CA6: 'f', 0x8CA7: 'r',
+      0x8069: 't', 0x8514: 't', 0x8A41: 'v',
+    };
+    ctx.getParameter = _fn('getParameter', function(pname) {
+      if (pname === 0x9245 || pname === 0x9246) {
+        return _g('getParameter', [pname === 0x9245 ? 0x1F00 : 0x1F01]);
+      }
+      var r = _g('getParameter', [pname]);
+      if (r === null || r === undefined) {
+        return params[pname] !== undefined ? params[pname] : null;
+      }
+      if (typeof r === 'string') {
+        if (pname === 0x1F02) return 'WebGL ' + (v2 ? '2.0' : '1.0') + ' (' + r + ')';
+        if (pname === 0x8B8C) return 'WebGL GLSL ES ' + (v2 ? '3.0' : '1.0') + ' (' + r + ')';
+        return r;
+      }
+      var arr = Array.isArray(r) ? r : null;
+      var tag = _GP_OBJ[pname];
+      if (tag) { var h = arr ? arr[0] : r; return _o[tag + h] || null; }
+      if (_GP_F4[pname]) return new Float32Array(arr ? arr.slice(0, 4) : [r]);
+      if (_GP_F2[pname]) return new Float32Array(arr ? arr.slice(0, 2) : [r]);
+      if (_GP_B4[pname]) { var b4 = arr || [r]; return [!!b4[0], !!b4[1], !!b4[2], !!b4[3]]; }
+      if (_GP_B1[pname]) return !!(arr ? arr[0] : r);
+      if (_GP_I4[pname]) return new Int32Array(arr ? arr.slice(0, 4) : [r]);
+      if (_GP_I2[pname]) return new Int32Array(arr ? arr.slice(0, 2) : [r]);
+      return arr ? arr[0] : r;
+    });
+    ctx.getContextAttributes = _fn('getContextAttributes', function() {
+      return { alpha: true, antialias: true, depth: true, desynchronized: false,
+        failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+        premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false };
+    });
+    ctx.isContextLost = _fn('isContextLost', function() { return false; });
+    ctx.checkFramebufferStatus = _fn('checkFramebufferStatus', function(t) {
+      return _g('checkFramebufferStatus', [t]);
+    });
+    ctx.getShaderPrecisionFormat = _fn('getShaderPrecisionFormat', function(st, pt) {
+      var r = _g('getShaderPrecisionFormat', [st, pt]);
+      var info = _inst(G.WebGLShaderPrecisionFormat);
+      if (r) { info.rangeMin = r.mn; info.rangeMax = r.mx; info.precision = r.p; }
+      return info;
+    });
+    ctx.getShaderInfoLog = _fn('getShaderInfoLog', function(sh) { return _g('getShaderInfoLog', [_hid(sh)]) || ''; });
+    ctx.getProgramInfoLog = _fn('getProgramInfoLog', function(p) { return _g('getProgramInfoLog', [_hid(p)]) || ''; });
+    ctx.getShaderSource = _fn('getShaderSource', function(sh) { return _g('getShaderSource', [_hid(sh)]) || ''; });
+    ctx.getAttachedShaders = _fn('getAttachedShaders', function(p) {
+      var ids = _g('getAttachedShaders', [_hid(p)]) || [];
+      return ids.map(function(h) { return _o['s' + h]; }).filter(Boolean);
+    });
+    ctx.getActiveAttrib = _fn('getActiveAttrib', function(p, i) {
+      var r = _g('getActiveAttrib', [_hid(p), i]);
+      if (!r) return null;
+      var info = _inst(G.WebGLActiveInfo);
+      info.name = r.n; info.size = r.s; info.type = r.t;
+      return info;
+    });
+    ctx.getActiveUniform = _fn('getActiveUniform', function(p, i) {
+      var r = _g('getActiveUniform', [_hid(p), i]);
+      if (!r) return null;
+      var info = _inst(G.WebGLActiveInfo);
+      info.name = r.n; info.size = r.s; info.type = r.t;
+      return info;
+    });
+    ctx.getAttribLocation = _fn('getAttribLocation', function(p, n) {
+      return _g('getAttribLocation', [_hid(p), String(n)]);
+    });
+    ctx.getUniformLocation = _fn('getUniformLocation', function(p, n) {
+      var loc = _g('getUniformLocation', [_hid(p), String(n)]);
+      return loc === null || loc < 0 ? null : _mk('l', 'WebGLUniformLocation', loc);
+    });
+    ctx.getUniform = _fn('getUniform', function(p, loc) {
+      return _g('getUniform', [_hid(p), _hid(loc)]);
+    });
+    ctx.getShaderParameter = _fn('getShaderParameter', function(sh, p) {
+      var r = _g('getShaderParameter', [_hid(sh), p]);
+      return p === 0x8B81 || p === 0x8B80 || p === 0x8B4F ? !!r : r;
+    });
+    ctx.getProgramParameter = _fn('getProgramParameter', function(p, pname) {
+      var r = _g('getProgramParameter', [_hid(p), pname]);
+      return pname === 0x8B82 || pname === 0x8B83 ? !!r : r;
+    });
+    ctx.getBufferParameter = _fn('getBufferParameter', function(t, p) {
+      return _g('getBufferParameter', [t, p]);
+    });
+    ctx.getFramebufferAttachmentParameter = _fn('getFramebufferAttachmentParameter', function(t, a, p) {
+      return _g('getFramebufferAttachmentParameter', [t, a, p]);
+    });
+    ctx.getRenderbufferParameter = _fn('getRenderbufferParameter', function(t, p) {
+      return _g('getRenderbufferParameter', [t, p]);
+    });
+    ctx.getTexParameter = _fn('getTexParameter', function(t, p) {
+      return _g('getTexParameter', [t, p]);
+    });
+    ctx.getVertexAttrib = _fn('getVertexAttrib', function(i, p) {
+      return _g('getVertexAttrib', [i, p]);
+    });
+    ctx.getVertexAttribOffset = _fn('getVertexAttribOffset', function(i, p) {
+      return _g('getVertexAttribOffset', [i, p]);
+    });
+
+    ctx.createShader = _fn('createShader', function(t) { return _mk('s', 'WebGLShader', _g('createShader', [t])); });
+    ctx.createProgram = _fn('createProgram', function() { return _mk('p', 'WebGLProgram', _g('createProgram')); });
+    ctx.createBuffer = _fn('createBuffer', function() { return _mk('b', 'WebGLBuffer', _g('genBuffers')); });
+    ctx.createTexture = _fn('createTexture', function() { return _mk('t', 'WebGLTexture', _g('genTextures')); });
+    ctx.createRenderbuffer = _fn('createRenderbuffer', function() { return _mk('r', 'WebGLRenderbuffer', _g('genRenderbuffers')); });
+    ctx.createFramebuffer = _fn('createFramebuffer', function() { return _mk('f', 'WebGLFramebuffer', _g('genFramebuffers')); });
+    ctx.createVertexArray = _fn('createVertexArray', function() { return _mk('v', 'WebGLVertexArrayObject', _g('genVertexArrays')); });
+    ctx.shaderSource = _fn('shaderSource', function(sh, src) { _g('shaderSource', [_hid(sh), String(src)]); });
+    ctx.bindBuffer = _fn('bindBuffer', function(t, b) { _g('bindBuffer', [t, _hid(b)]); });
+    ctx.bindTexture = _fn('bindTexture', function(t, tx) { _g('bindTexture', [t, _hid(tx)]); });
+    ctx.bindRenderbuffer = _fn('bindRenderbuffer', function(t, rb) { _g('bindRenderbuffer', [t, _hid(rb)]); });
+    ctx.bindFramebuffer = _fn('bindFramebuffer', function(t, fb) { _g('bindFramebuffer', [t, _hid(fb)]); });
+    ctx.deleteShader = _fn('deleteShader', function(o) { _g('deleteShader', [_hid(o)]); });
+    ctx.deleteProgram = _fn('deleteProgram', function(o) { _g('deleteProgram', [_hid(o)]); });
+    ctx.deleteBuffer = _fn('deleteBuffer', function(o) { _g('deleteBuffer', [_hid(o)]); });
+    ctx.deleteTexture = _fn('deleteTexture', function(o) { _g('deleteTexture', [_hid(o)]); });
+    ctx.deleteRenderbuffer = _fn('deleteRenderbuffer', function(o) { _g('deleteRenderbuffer', [_hid(o)]); });
+    ctx.deleteFramebuffer = _fn('deleteFramebuffer', function(o) { _g('deleteFramebuffer', [_hid(o)]); });
+    ctx.deleteVertexArray = _fn('deleteVertexArray', function(o) { _g('deleteVertexArray', [_hid(o)]); });
+    ctx.isShader = _fn('isShader', function(o) { return !!_g('isShader', [_hid(o)]); });
+    ctx.isProgram = _fn('isProgram', function(o) { return !!_g('isProgram', [_hid(o)]); });
+    ctx.isBuffer = _fn('isBuffer', function(o) { return !!_g('isBuffer', [_hid(o)]); });
+    ctx.isTexture = _fn('isTexture', function(o) { return !!_g('isTexture', [_hid(o)]); });
+    ctx.isRenderbuffer = _fn('isRenderbuffer', function(o) { return !!_g('isRenderbuffer', [_hid(o)]); });
+    ctx.isFramebuffer = _fn('isFramebuffer', function(o) { return !!_g('isFramebuffer', [_hid(o)]); });
+    ctx.isVertexArray = _fn('isVertexArray', function(o) { return !!_g('isVertexArray', [_hid(o)]); });
+    ctx.bufferData = _fn('bufferData', function(t, data, usage) {
+      if (typeof data === 'number') _g('bufferData', [t, { n: data }, usage]);
+      else _g('bufferData', [t, _u8b64(data), usage]);
+    });
+    ctx.bufferSubData = _fn('bufferSubData', function(t, off, data) {
+      _g('bufferSubData', [t, off, _u8b64(data)]);
+    });
+    ctx.texImage2D = _fn('texImage2D', function(t, lvl, internal, w, h, border, format, type, pixels) {
+      if (typeof w === 'number' && typeof h === 'number') {
+        _g('texImage2D', [t, lvl, internal, w, h, border || 0, format, type, _u8b64(pixels)]);
+      }
+    });
+    ['vertexAttrib1f', 'vertexAttrib2f', 'vertexAttrib3f', 'vertexAttrib4f'].forEach(function(name) {
+      ctx[name] = _fn(name, function(i) {
+        _g(name, [i].concat(Array.prototype.slice.call(arguments, 1)));
+      });
+    });
+    ['vertexAttrib1fv', 'vertexAttrib2fv', 'vertexAttrib3fv', 'vertexAttrib4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(i, v) { _g(name, [i, _arr(v)]); });
+    });
+    ['uniform1i', 'uniform2i', 'uniform3i', 'uniform4i',
+     'uniform1f', 'uniform2f', 'uniform3f', 'uniform4f'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc) {
+        _g(name, [_hid(loc)].concat(Array.prototype.slice.call(arguments, 1)));
+      });
+    });
+    ['uniform1iv', 'uniform2iv', 'uniform3iv', 'uniform4iv',
+     'uniform1fv', 'uniform2fv', 'uniform3fv', 'uniform4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc, v) { _g(name, [_hid(loc), _arr(v)]); });
+    });
+    ['uniformMatrix2fv', 'uniformMatrix3fv', 'uniformMatrix4fv'].forEach(function(name) {
+      ctx[name] = _fn(name, function(loc, transpose, v) {
+        _g(name, [_hid(loc), transpose ? 1 : 0, _arr(v)]);
+      });
+    });
+    ctx.drawBuffers = _fn('drawBuffers', function(bufs) { _g('drawBuffers', [_arr(bufs)]); });
+    // Methods without a real-backend arm fall back to inert stubs, the same
+    // coverage the pure-JS shim had.
+    for (const m of _glVoidMethods) if (!ctx[m]) ctx[m] = _fn(m, function() {});
+    for (const m of _glNullMethods) if (!ctx[m]) ctx[m] = _fn(m, function() { return null; });
+    for (const m of _glFalseMethods) if (!ctx[m]) ctx[m] = _fn(m, function() { return false; });
+    for (const m in _glObjectCtors) {
+      if (!ctx[m]) ctx[m] = _fn(m, (function(cls) {
+        return function() { return _inst(G[cls]); };
+      })(_glObjectCtors[m]));
+    }
+    return ctx;
+  }
+  function _installWebGLContextShim(canvas, v2) {
+
+    var proto = v2 ? G.WebGL2RenderingContext.prototype : G.WebGLRenderingContext.prototype;
+    var ctx = Object.create(proto);
+    var params = v2 ? _gl2Params : _gl1Params;
+    var exts = v2 ? _gl2Exts : _gl1Exts;
+    ctx._canvas = canvas;
+    ctx.canvas = canvas;
+    ctx.drawingBufferColorSpace = 'srgb';
+    ctx.unpackColorSpace = 'srgb';
+    Object.assign(ctx, _glConsts);
+    if (v2) Object.assign(ctx, _gl2Consts);
+    ctx.getParameter = _fn('getParameter', function(pname) {
+      return Object.prototype.hasOwnProperty.call(params, pname) ? params[pname] : null;
+    });
+    ctx.getSupportedExtensions = _fn('getSupportedExtensions', function() { return exts.slice(); });
+    ctx.getExtension = _fn('getExtension', function(name) {
+      if (exts.indexOf(name) < 0) return null;
+      return _glExtObjects[name] || {};
+    });
+    ctx.getContextAttributes = _fn('getContextAttributes', function() {
+      return { alpha: true, antialias: true, depth: true, desynchronized: false,
+        failIfMajorPerformanceCaveat: false, powerPreference: 'default',
+        premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false };
+    });
+    ctx.isContextLost = _fn('isContextLost', function() { return false; });
+    ctx.getError = _fn('getError', function() { return 0; });
+    ctx.checkFramebufferStatus = _fn('checkFramebufferStatus', function() { return 0x8CD5; });
+    ctx.getShaderPrecisionFormat = _fn('getShaderPrecisionFormat', function() {
+      return { rangeMin: 127, rangeMax: 127, precision: 23 };
+    });
+    ctx.getShaderInfoLog = _fn('getShaderInfoLog', function() { return ''; });
+    ctx.getProgramInfoLog = _fn('getProgramInfoLog', function() { return ''; });
+    ctx.getShaderSource = _fn('getShaderSource', function() { return ''; });
+    ctx.getAttachedShaders = _fn('getAttachedShaders', function() { return []; });
+    ctx.getActiveAttrib = _fn('getActiveAttrib', function() {
+      var info = _inst(G.WebGLActiveInfo);
+      info.name = ''; info.size = 0; info.type = 0;
+      return info;
+    });
+    ctx.getActiveUniform = _fn('getActiveUniform', function() {
+      var info = _inst(G.WebGLActiveInfo);
+      info.name = ''; info.size = 0; info.type = 0;
+      return info;
+    });
+    ctx.getUniformLocation = _fn('getUniformLocation', function() { return _inst(G.WebGLUniformLocation); });
+    ctx.getVertexAttribOffset = _fn('getVertexAttribOffset', function() { return 0; });
+    ctx.getFragDataLocation = _fn('getFragDataLocation', function() { return -1; });
+    ctx.getUniformBlockIndex = _fn('getUniformBlockIndex', function() { return 0; });
+    ctx.readPixels = _fn('readPixels', function(_x, _y, _w, _h, _format, _type, pixels) {
+      if (pixels && typeof pixels.fill === 'function') pixels.fill(0);
+    });
+    for (const m of _glVoidMethods) ctx[m] = _fn(m, function() {});
+    for (const m of _glNullMethods) ctx[m] = _fn(m, function() { return null; });
+    for (const m of _glFalseMethods) ctx[m] = _fn(m, function() { return false; });
+    for (const m in _glObjectCtors) {
+      ctx[m] = _fn(m, (function(cls) {
+        return function() { return _inst(G[cls]); };
+      })(_glObjectCtors[m]));
+    }
+    return ctx;
+  }
+  _createWebGLContext = _installWebGLContext;
+  var _BAC = _defClass('BaseAudioContext');
+  if (G.AudioContext) try { Object.setPrototypeOf(G.AudioContext.prototype, _BAC.prototype); } catch (_e) {}
+  if (G.OfflineAudioContext) try { Object.setPrototypeOf(G.OfflineAudioContext.prototype, _BAC.prototype); } catch (_e) {}
+  Navigator.prototype.clearOriginJoinedAdInterestGroups = _fn('clearOriginJoinedAdInterestGroups', function() { return Promise.resolve(); });
+}
+
+_installChromeSurface(globalThis);
+
+var _createWebGLContext;
+var _pageSeedNavigationEntry;
+
+function _mkScreenOrientation() {
+  var o = {
+    type: 'landscape-primary', angle: 0,
+    addEventListener() {}, removeEventListener() {},
+    dispatchEvent(event) { _demoteAuthorEvent(event); return true; },
+    onchange: null,
+  };
+  if (globalThis.ScreenOrientation) {
+    try { Object.setPrototypeOf(o, globalThis.ScreenOrientation.prototype); } catch (_e) {}
+  }
+  return o;
+}
+
 (function _collectIframeRealmGlobals() {
   const standardGlobals = [
     'Infinity', 'NaN', 'undefined',

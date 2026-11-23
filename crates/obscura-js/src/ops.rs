@@ -7574,6 +7574,96 @@ fn op_document_realm_member<'s, 'i>(
     member.unwrap_or_else(|| v8::undefined(scope).into())
 }
 
+extern "C" {
+    /// `v8::ObjectTemplate::MarkAsUndetectable`. rusty_v8 does not bind it, so
+    /// link the C++ symbol from the static v8 archive directly. Chrome's
+    /// `document.all` is an undetectable object: `typeof` reports 'undefined'
+    /// and `== null` is true while property access still works.
+    #[link_name = "_ZN2v814ObjectTemplate18MarkAsUndetectableEv"]
+    fn mark_as_undetectable(this: *mut v8::ObjectTemplate);
+    /// `v8::ObjectTemplate::SetCallAsFunctionHandler`, also unbound in
+    /// rusty_v8. V8 requires undetectable objects to be callable (which
+    /// matches Chrome: `document.all(x)` equals `document.all.namedItem(x)`).
+    #[link_name = "_ZN2v814ObjectTemplate24SetCallAsFunctionHandlerEPFvRKNS_20FunctionCallbackInfoINS_5ValueEEEENS_5LocalIS2_EE"]
+    fn set_call_as_function_handler(
+        this: *mut v8::ObjectTemplate,
+        callback: v8::FunctionCallback,
+        data: v8::Local<v8::Value>,
+    );
+}
+
+/// `document.all(arg)` forwards to the same resolver as property lookup.
+unsafe extern "C" fn document_all_call(info: *const v8::FunctionCallbackInfo) {
+    let info = unsafe { &*info };
+    let mut storage = unsafe { v8::CallbackScope::new(info) };
+    let mut scope = unsafe { std::pin::Pin::new_unchecked(&mut storage) }.init();
+    let scope = &mut scope;
+    let args = v8::FunctionCallbackArguments::from_function_callback_info(info);
+    let mut rv = v8::ReturnValue::from_function_callback_info(info);
+    let data = v8::Local::new(scope, args.data());
+    let Ok(resolve) = v8::Local::<v8::Function>::try_from(data) else { return };
+    let arg = if args.length() > 0 { args.get(0) } else { v8::undefined(scope).into() };
+    if let Some(result) = resolve.call(scope, args.this().into(), &[arg]) {
+        rv.set(result);
+    }
+}
+
+fn document_all_resolve(
+    scope: &mut v8::PinScope,
+    args: v8::PropertyCallbackArguments,
+    key: v8::Local<v8::Value>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) -> v8::Intercepted {
+    let data = v8::Local::new(scope, args.data());
+    let Ok(resolve) = v8::Local::<v8::Function>::try_from(data) else { return v8::Intercepted::kNo };
+    let Some(result) = resolve.call(scope, args.holder().into(), &[key]) else { return v8::Intercepted::kNo };
+    if result.is_undefined() { return v8::Intercepted::kNo; }
+    rv.set(result);
+    v8::Intercepted::kYes
+}
+
+/// Chrome's `document.all` is an undetectable live collection. The V8 flag
+/// comes from `mark_as_undetectable`; every named and indexed lookup forwards
+/// to a per-document JS `resolve(key)` returning the element or count, and
+/// `undefined` for misses so normal prototype lookup (`item`, `namedItem`,
+/// `tags`, `hasOwnProperty`) still applies.
+#[op2]
+fn op_document_all<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    resolve: v8::Local<'s, v8::Function>,
+) -> v8::Local<'s, v8::Value> {
+    let object = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let template = v8::ObjectTemplate::new(scope);
+        // SAFETY: `Local<ObjectTemplate>` is a live pointer to a C++
+        // ObjectTemplate; `MarkAsUndetectable(this)` only mutates the template.
+        unsafe { mark_as_undetectable(&*template as *const v8::ObjectTemplate as *mut v8::ObjectTemplate) };
+        // SAFETY: undetectable instances must be callable; the handler forwards
+        // to the same JS resolver while it stays alive as template data.
+        unsafe { set_call_as_function_handler(&*template as *const v8::ObjectTemplate as *mut v8::ObjectTemplate,
+            document_all_call, resolve.into()) };
+        template.set_named_property_handler(v8::NamedPropertyHandlerConfiguration::new()
+            .data(resolve.into())
+            .getter(|scope: &mut v8::PinScope, key: v8::Local<v8::Name>,
+                args: v8::PropertyCallbackArguments, rv: v8::ReturnValue<v8::Value>| {
+                document_all_resolve(scope, args, key.into(), rv)
+            }));
+        template.set_indexed_property_handler(v8::IndexedPropertyHandlerConfiguration::new()
+            .data(resolve.into())
+            .getter(|scope: &mut v8::PinScope, index: u32,
+                args: v8::PropertyCallbackArguments, rv: v8::ReturnValue<v8::Value>| {
+                let key = v8::Integer::new_from_unsigned(scope, index);
+                document_all_resolve(scope, args, key.into(), rv)
+            }));
+        let tag = v8::Symbol::get_to_string_tag(scope);
+        let name = v8::String::new(scope, "HTMLAllCollection")?;
+        template.set(tag.into(), name.into());
+        template.new_instance(scope)
+    }));
+    object.unwrap_or_else(|_| None)
+        .map(Into::into)
+        .unwrap_or_else(|| v8::undefined(scope).into())
+}
+
 /// Limit live contexts and DOM trees, including initial realms awaiting Page
 /// adoption. Synchronous and fetched frames share the same per-page budget.
 pub fn max_live_frames() -> usize {
@@ -7581,25 +7671,25 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
-/// Initial blank and srcdoc documents share their creator's realm setup.
-/// reentrant: the initialize callback synchronously bootstraps the child
-/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
-/// re-entrancy check aborts the whole process.
-#[op2(reentrant)]
-fn op_initial_frame(
-    scope: &mut v8::PinScope,
+/// Claims a frame identity for an `about:blank`/`about:srcdoc` iframe without
+/// building its V8 realm. The realm only exists once script actually reaches
+/// into the frame (`contentWindow`, `contentDocument`, a posted message), so
+/// documents that plant many scriptless frames pay no context at all. The
+/// pending-frame record still drives Page adoption, `frame_urls`, and the
+/// event-loop wake, exactly as an eagerly built realm did.
+#[op2(fast)]
+fn op_declare_frame(
     state: &OpState,
     parent_frame_id: u32,
-    initialize: v8::Local<v8::Function>,
     owner_node: u32,
-    #[string] srcdoc: Option<String>,
+    is_srcdoc: bool,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
         let parent_state = frame_state(state, parent_frame_id);
-        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
-        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
+        let frame_url = if is_srcdoc { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len();
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
             || page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
@@ -7608,6 +7698,60 @@ fn op_initial_frame(
         }
         let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
         page.borrow_mut().frame_id_counter = frame_id;
+        registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        let mut page = page.borrow_mut();
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
+        page.pending_frames.push(PendingFrame {
+            frame_id,
+            parent_frame_id,
+            url: frame_url.to_string(),
+            html: String::new(),
+            viewport_width: 300,
+            viewport_height: 150,
+        });
+        frame_id
+    })).unwrap_or(0)
+}
+
+/// Initial blank and srcdoc documents share their creator's realm setup.
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+///
+/// `declared_frame_id` reuses an id claimed earlier with `op_declare_frame`:
+/// the pending-frame record and owner bookkeeping already exist, so only the
+/// realm itself is built here.
+#[op2(reentrant)]
+fn op_initial_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    parent_frame_id: u32,
+    initialize: v8::Local<v8::Function>,
+    owner_node: u32,
+    #[string] srcdoc: Option<String>,
+    declared_frame_id: u32,
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let page = state.borrow::<SharedState>().clone();
+        let parent_state = frame_state(state, parent_frame_id);
+        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
+        let declared = declared_frame_id != 0;
+        if registry.borrow().live_count() >= max_live_frames()
+            || (!declared && page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS)
+            || (!declared
+                && page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES)
+        {
+            return 0;
+        }
+        let frame_id = if declared {
+            declared_frame_id
+        } else {
+            let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
+            page.borrow_mut().frame_id_counter = frame_id;
+            frame_id
+        };
         let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
         let main_context = scope.get_current_context();
         let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
@@ -7655,7 +7799,9 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        if !declared {
+            registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        }
         registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
@@ -7668,16 +7814,18 @@ fn op_initial_frame(
         // Initialization needs the creator's token; author code must never
         // retain it when the sandbox requires an opaque origin.
         if opaque { context.use_default_security_token(); }
-        let mut page = page.borrow_mut();
-        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
-        page.pending_frames.push(PendingFrame {
-            frame_id,
-            parent_frame_id,
-            url: frame_url.to_string(),
-            html: String::new(),
-            viewport_width: 300,
-            viewport_height: 150,
-        });
+        if !declared {
+            let mut page = page.borrow_mut();
+            page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
+            page.pending_frames.push(PendingFrame {
+                frame_id,
+                parent_frame_id,
+                url: frame_url.to_string(),
+                html: String::new(),
+                viewport_width: 300,
+                viewport_height: 150,
+            });
+        }
         frame_id
     })).unwrap_or(0)
 }
@@ -8871,9 +9019,95 @@ fn op_frame_name(state: &OpState, context_id: u32, #[string] value: Option<Strin
     })
 }
 
+/// Codec bridge for `CompressionStream`/`DecompressionStream`. Formats follow
+/// the Compression Streams spec: "gzip" (RFC 1952), "deflate" (zlib, RFC 1950),
+/// and "deflate-raw" (RFC 1951). The JS wrapper buffers a stream's chunks and
+/// transforms the whole payload per call, so one-shot encode/decode is enough.
+#[op2]
+#[string]
+fn op_compress(
+    #[string] direction: &str,
+    #[string] format: &str,
+    #[string] data_b64: &str,
+) -> Result<String, deno_error::JsErrorBox> {
+    use std::io::{Read, Write};
+    let data = BASE64
+        .decode(data_b64)
+        .map_err(|e| deno_error::JsErrorBox::type_error(format!("Invalid binary input: {e}")))?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<Vec<u8>> {
+        match (direction, format) {
+            ("compress", "gzip") => {
+                let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("compress", "deflate") => {
+                let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("compress", "deflate-raw") => {
+                let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&data)?;
+                enc.finish()
+            }
+            ("decompress", "gzip") => {
+                let mut out = Vec::new();
+                flate2::read::GzDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            ("decompress", "deflate") => {
+                let mut out = Vec::new();
+                flate2::read::ZlibDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            ("decompress", "deflate-raw") => {
+                let mut out = Vec::new();
+                flate2::read::DeflateDecoder::new(&data[..]).read_to_end(&mut out)?;
+                Ok(out)
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported {direction} format: {format}"),
+            )),
+        }
+    }));
+    let out = result
+        .map_err(|_| deno_error::JsErrorBox::generic("compression failed"))?
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    Ok(BASE64.encode(out))
+}
+
+
+// --- Real GLES backend (crates/obscura-js/src/gl.rs). Returns -1 when the
+// host has no usable libEGL/libGLESv2 so bootstrap can keep its null-context
+// behavior.
+#[op2(fast)]
+fn op_gl_create(state: &mut OpState, width: i32, height: i32, es3: bool) -> i32 {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    let mut registry = registry.borrow_mut();
+    registry.create(width, height, es3)
+}
+
+#[op2(fast)]
+fn op_gl_free(state: &mut OpState, id: i32) {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    registry.borrow_mut().destroy(id);
+}
+
+#[op2]
+#[string]
+fn op_gl(state: &mut OpState, id: i32, #[string] payload: String) -> String {
+    let registry = state.borrow::<Rc<RefCell<crate::gl::GlContexts>>>().clone();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+    let mut registry = registry.borrow_mut();
+    serde_json::to_string(&registry.call(id, &payload)).unwrap_or_default()
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_compress(),
         op_form_owner(),
         op_form_cache_buffer(),
         op_create_select_allocator(),
@@ -8908,11 +9142,13 @@ pub fn build_extension() -> Extension {
         op_history_traverse(),
         op_frame_document_ready(),
         op_initial_frame(),
+        op_declare_frame(),
         op_connect_frame(),
         op_frame_context(),
         op_frame_relation(),
         op_frame_name(),
         op_document_realm_member(),
+        op_document_all(),
         op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),
@@ -8970,6 +9206,9 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_control());
     }
     ops.push(op_frame_preload_scripts());
+    ops.push(op_gl_create());
+    ops.push(op_gl_free());
+    ops.push(op_gl());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
