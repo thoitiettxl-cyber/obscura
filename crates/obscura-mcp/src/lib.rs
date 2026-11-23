@@ -375,7 +375,8 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "number", "minimum": 0, "description": "Character budget shared by whole control descriptions and visible body text (default: 4000); URL and title are separately capped at 256 characters each" }
+                        "max_chars": { "type": "number", "minimum": 0, "description": "Character budget shared by whole control descriptions and visible body text (default: 4000); URL and title are separately capped at 256 characters each. When the content exceeds the budget the last ~12% is kept as a tail so pagination/nav links survive" },
+                        "offset": { "type": "number", "minimum": 0, "description": "Character offset into the full snapshot for paging (default 0); the truncation marker advertises the next offset" }
                     },
                     "additionalProperties": false
                 }
@@ -508,7 +509,8 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "number", "description": "Truncate to this many characters (default 4000)" }
+                        "max_chars": { "type": "number", "description": "Truncate to this many characters (default 4000); the last ~12% is kept as a tail so trailing links survive" },
+                        "offset": { "type": "number", "minimum": 0, "description": "Character offset into the full markdown for paging (default 0)" }
                     }
                 }
             },
@@ -529,7 +531,9 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "limit": { "type": "number", "description": "Max number of elements (default 100)" }
+                        "limit": { "type": "number", "description": "Max number of elements (default 100)" },
+                        "max_chars": { "type": "number", "description": "Character budget for the listing (default 4000); the last ~12% is kept as a tail so trailing controls survive" },
+                        "offset": { "type": "number", "minimum": 0, "description": "Character offset into the full listing for paging (default 0)" }
                     }
                 }
             },
@@ -1011,6 +1015,46 @@ fn truncate(text: &str, max_chars: usize) -> String {
     format!("{head}\n...(truncated, {remaining} more chars)")
 }
 
+/// Port of camofox's `windowSnapshot`: when a text exceeds the budget, keep
+/// a head chunk plus the trailing `tail` chars so pagination and navigation
+/// affordances at the end of the page survive truncation. `offset` (chars)
+/// pages through the body; the marker advertises the next offset. Chunk and
+/// tail boundaries snap to line starts so a `ref=` line is never advertised
+/// truncated.
+fn window_text(text: &str, max_chars: usize, offset: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    if max_chars == 0 || total == 0 {
+        return String::new();
+    }
+    if total <= max_chars && offset == 0 {
+        return text.to_string();
+    }
+    let tail_len = (max_chars / 8).clamp(64, 500).min(total);
+    let budget = max_chars.saturating_sub(tail_len + 96).max(1);
+    let start = offset.min(total - tail_len);
+    let mut end = (start + budget).min(total - tail_len);
+    // Never end mid-line: a split `ref=` line would advertise a dead reference.
+    if let Some(rel) = chars[start..end].iter().rposition(|c| *c == '\n') {
+        end = start + rel + 1;
+    }
+    // The tail starts at a line boundary too, when one exists inside it.
+    let mut tail_start = total - tail_len;
+    if let Some(rel) = chars[tail_start..].iter().position(|c| *c == '\n') {
+        if rel > 0 {
+            tail_start += rel + 1;
+        }
+    }
+    let has_more = end < total - tail_len;
+    let chunk: String = chars[start..end].iter().collect();
+    let tail: String = chars[tail_start..].iter().collect();
+    if has_more {
+        format!("{chunk}[... truncated at char {end} of {total}; pass offset={end} for more. Pagination links below. ...]\n{tail}")
+    } else {
+        format!("{chunk}{tail}")
+    }
+}
+
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
@@ -1050,6 +1094,7 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
 fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
         .unwrap_or(DEFAULT_TEXT_LIMIT);
+    let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(0);
     rebuild_interactive_refs(state)?;
     let page = state.page_mut();
     let url = truncate(&page.url_string(), 256);
@@ -1065,21 +1110,10 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     }).unwrap_or_default();
 
     let lines = context.as_ref().map(|context| interactive_lines(state, context, usize::MAX)).unwrap_or_default();
-    let mut content = String::new();
-    let mut remaining = max_chars;
-    let mut shown = 0;
-    for line in &lines {
-        let cost = line.chars().count() + 1;
-        if cost > remaining { break; }
-        content.push_str(line);
-        content.push('\n');
-        remaining -= cost;
-        shown += 1;
-    }
-    if shown < lines.len() {
-        content.push_str(&format!("...({} controls omitted; use browser_interactive_elements)\n", lines.len() - shown));
-    }
-    content.push_str(&truncate(body_text.trim(), remaining));
+    let mut full = lines.join("\n");
+    if !full.is_empty() { full.push('\n'); }
+    full.push_str(body_text.trim());
+    let content = window_text(&full, max_chars, offset);
     Ok(format!("URL: {url}\nTitle: {title}\n\n{content}"))
 }
 
@@ -1381,8 +1415,9 @@ fn tool_close(state: &mut BrowserState) -> Result<String, String> {
 fn tool_markdown(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
         .unwrap_or(DEFAULT_TEXT_LIMIT);
+    let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(0);
     let page = state.page_mut();
-    Ok(truncate(&page.markdown(), max_chars))
+    Ok(window_text(&page.markdown(), max_chars, offset))
 }
 
 /// Enumerate every `<a href>` on the page. One JSON object per line so
@@ -1437,13 +1472,16 @@ fn tool_links(args: &Value, state: &mut BrowserState) -> Result<String, String> 
 /// to each element so the ref survives until the next navigation.
 fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+    let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
+        .unwrap_or(DEFAULT_TEXT_LIMIT);
+    let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(0);
     rebuild_interactive_refs(state)?;
     let context = accessibility_context(state.page_mut());
     let lines = context.as_ref().map(|context| interactive_lines(state, context, limit)).unwrap_or_default();
     if lines.is_empty() {
         return Ok("No interactive elements on this page.".to_string());
     }
-    Ok(lines.join("\n"))
+    Ok(window_text(&lines.join("\n"), max_chars, offset))
 }
 
 fn accessibility_context(page: &Page) -> Option<obscura_browser::accessibility::AccessibilityContext> {
@@ -2547,6 +2585,97 @@ mod tests {
         let empty = tool_snapshot(&json!({"max_chars":0}), &mut state).unwrap();
         assert!(!empty.lines().any(|line| line.starts_with("ref=")));
         assert!(empty.chars().count() < 800);
+    }
+
+    #[test]
+    fn window_text_passthrough_when_content_fits() {
+        assert_eq!(window_text("short text", 4000, 0), "short text");
+        assert_eq!(window_text("short text", 4000, 0), "short text");
+        assert_eq!(window_text("anything", 0, 0), "");
+        assert_eq!(window_text("", 4000, 0), "");
+    }
+
+    #[test]
+    fn window_text_keeps_tail_and_advertises_next_offset() {
+        let body: String = (0..400).map(|i| format!("line {i} padded to a reasonable length\n")).collect();
+        let total = body.chars().count();
+        let first = window_text(&body, 1000, 0);
+        assert!(first.contains("truncated at char"), "marker must appear: {first}");
+        assert!(first.contains("line 399"), "tail must keep the last lines: {first}");
+        let next_offset: usize = first.split("offset=").nth(1).unwrap()
+            .split_whitespace().next().unwrap().parse().unwrap();
+        assert!(next_offset > 0 && next_offset < total);
+        // Page through until the marker is gone; each window still carries the tail.
+        let mut window = first.clone();
+        let mut offset = next_offset;
+        for _ in 0..40 {
+            window = window_text(&body, 1000, offset);
+            let Some(rest) = window.split("offset=").nth(1) else { break };
+            offset = rest.split_whitespace().next().unwrap().parse().unwrap();
+        }
+        assert!(!window.contains("offset="), "last window has no next offset: {window}");
+        assert!(window.contains("line 399"));
+        for line in window.lines() {
+            if line.starts_with("line ") {
+                assert!(line.len() > 20, "no line may be split mid-content: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn window_text_never_splits_a_line() {
+        let body: String = (0..50).map(|i| format!("ref=e1-{i} button \\\"b{i}\\\" role=button\n")).collect();
+        let windowed = window_text(&body, 300, 0);
+        for line in windowed.lines() {
+            if line.starts_with("ref=") {
+                assert!(line.contains("role=button"), "ref line must be whole: {line:?}");
+            }
+        }
+        assert!(windowed.contains("truncated at char"), "{windowed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_offset_pages_reach_end_of_page_controls() {
+        let mut state = BrowserState::new(None, None, false);
+        let buttons: String = (0..40).map(|i| format!("<button>btn{i}</button>")).collect();
+        let filler = "x".repeat(6000);
+        state.page_mut().navigate(&format!("data:text/html,{buttons}<p>{filler}</p><button>pagination-next</button><a href=/page/2>next page</a>")).await.unwrap();
+        let first = tool_snapshot(&json!({"max_chars": 1200}), &mut state).unwrap();
+        assert!(first.contains("pagination-next"), "tail must keep end-of-page controls: {first}");
+        assert!(first.contains("offset="), "marker must advertise next offset");
+        // Page through until the marker is gone; the tail is present in every window.
+        let mut window = first;
+        for _ in 0..20 {
+            let Some(rest) = window.split("offset=").nth(1) else { break };
+            let next: u64 = rest.split_whitespace().next().unwrap().parse().unwrap();
+            window = tool_snapshot(&json!({"max_chars": 1200, "offset": next}), &mut state).unwrap();
+        }
+        assert!(!window.contains("offset="), "final window must not advertise another offset: {window}");
+        assert!(window.contains("pagination-next"), "last window still shows the tail: {window}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn markdown_window_preserves_trailing_links() {
+        let mut state = BrowserState::new(None, None, false);
+        let filler = "long prose paragraph. ".repeat(600);
+        state.page_mut().navigate(&format!("data:text/html,<p>{filler}</p><a href=/next>next</a>")).await.unwrap();
+        let page = tool_markdown(&json!({"max_chars": 800}), &mut state).unwrap();
+        assert!(page.contains("[next](/next)"), "tail keeps trailing links: {page}");
+        assert!(page.contains("offset="));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_elements_window_pages_refs() {
+        let mut state = BrowserState::new(None, None, false);
+        let buttons: String = (0..60).map(|i| format!("<button>button number {i} with a longer label</button>")).collect();
+        state.page_mut().navigate(&format!("data:text/html,{buttons}")).await.unwrap();
+        let first = tool_interactive_elements(&json!({"max_chars": 800}), &mut state).unwrap();
+        assert!(first.contains("button number 59"), "tail keeps the last controls: {first}");
+        for line in first.lines() {
+            if line.starts_with("ref=") {
+                assert!(line.contains("role=button"), "no ref line may be split: {line:?}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
