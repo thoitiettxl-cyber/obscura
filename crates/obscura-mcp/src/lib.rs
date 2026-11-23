@@ -750,21 +750,29 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_storage_state",
-                "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object. Save this to skip a login on a subsequent run via browser_set_storage_state.",
-                "inputSchema": { "type": "object", "properties": {} }
+                "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object in Playwright storageState shape (httpOnly/sameSite cookie fields, {name, value} storage entries; sessionStorage is an obscura extension). Save this to skip a login on a subsequent run via browser_set_storage_state. Pass `path` to write the JSON to a file instead of returning it (atomic tmp+rename, mode 0600).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Optional file path to write the exported JSON to (atomic, owner-only)." }
+                    }
+                }
             },
             {
                 "name": "browser_set_storage_state",
-                "description": "Restore session state previously returned by browser_storage_state. Pass the JSON object. Use to bring an authenticated session back without re-logging in.",
+                "description": "Restore session state previously returned by browser_storage_state — inline as `state`, or from a file via `path` (accepts Playwright context.storageState() files). Use to bring an authenticated session back without re-logging in.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "state": {
                             "type": "object",
                             "description": "{cookies: [...], origins: [{origin, localStorage: [...], sessionStorage: [...]}]}"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File containing a storage-state JSON object, e.g. written by browser_storage_state or Playwright's context.storageState()."
                         }
-                    },
-                    "required": ["state"]
+                    }
                 }
             }
     ]).as_array().cloned().expect("MCP tool list must be an array");
@@ -888,7 +896,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_tab_switch" => tool_tab_switch(args, state),
         "browser_tab_close" => tool_tab_close(args, state),
         "browser_search" => tool_search(args, state),
-        "browser_storage_state" => tool_storage_state(state),
+        "browser_storage_state" => tool_storage_state(args, state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
         "web_search" if web_search_enabled() => tool_web_search(args, state).await,
         _ => Err(format!("Unknown tool: {name}")),
@@ -2759,22 +2767,52 @@ fn format_web_results(query: &str, body: &Value) -> String {
 /// Export full session state: cookies + localStorage + sessionStorage
 /// for every origin the page knows about. Agents stash this between
 /// runs to skip a login flow.
-fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
+/// Write `bytes` to `path` via a sibling tmp file + rename (camofox's
+/// persistStorageState pattern), creating parents and keeping the file
+/// owner-only: a storage-state file holds live auth material.
+fn write_storage_state_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("storage-state.json");
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// One origin's web-storage entries, emitted as Playwright's `{name, value}`
+/// objects.
+fn storage_entries_json(entries: Vec<(String, String)>) -> Value {
+    json!(entries.into_iter().map(|(k, v)| json!({ "name": k, "value": v })).collect::<Vec<_>>())
+}
+
+fn tool_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies().iter().map(|c| json!({
         "name": c.name,
         "value": c.value,
         "domain": c.domain,
         "path": c.path,
         "secure": c.secure,
-        "http_only": c.http_only,
-        "same_site": c.same_site,
+        "httpOnly": c.http_only,
+        "sameSite": c.same_site,
         "expires": c.expires,
     })).collect();
     let mut origins = std::collections::BTreeMap::new();
     for (origin, entries) in state.context.local_storage.entries() {
         let entries: Vec<_> = entries.into_iter().map(|(k, v)| (decode_storage_string(k), decode_storage_string(v))).collect();
         origins.insert(origin.clone(), json!({
-            "origin": origin, "localStorage": entries, "sessionStorage": []
+            "origin": origin, "localStorage": storage_entries_json(entries), "sessionStorage": []
         }));
     }
     if let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) {
@@ -2783,21 +2821,52 @@ fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
             let entry = origins.entry(origin.clone()).or_insert_with(|| json!({
                 "origin": origin, "localStorage": [], "sessionStorage": []
             }));
-            entry["sessionStorage"] = json!(entries);
+            entry["sessionStorage"] = storage_entries_json(entries);
         }
     }
     let origins: Vec<_> = origins.into_values().collect();
     let out = json!({ "cookies": cookies, "origins": origins });
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    let serialized = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        let path = std::path::PathBuf::from(path);
+        write_storage_state_atomically(&path, serialized.as_bytes()).map_err(|e| e.to_string())?;
+        return Ok(format!(
+            "Wrote storage state ({} cookies, {} origins) to {}",
+            cookies.len(), origins.len(), path.display(),
+        ));
+    }
+    Ok(serialized)
 }
 
-#[derive(Deserialize)]
 struct StorageOrigin {
     origin: String,
-    #[serde(default, rename = "localStorage")]
     local_storage: Vec<(String, String)>,
-    #[serde(default, rename = "sessionStorage")]
     session_storage: Vec<(String, String)>,
+}
+
+/// Storage entries arrive either as Playwright `{name, value}` objects or as
+/// `[name, value]` tuples (the shape this tool emitted before). Accept both.
+fn parse_storage_entries(value: &Value) -> Result<Vec<(String, String)>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("storage entries must be an array".into());
+    };
+    entries.iter().map(|entry| {
+        if let Some(object) = entry.as_object() {
+            let name = object.get("name").and_then(Value::as_str);
+            let value = object.get("value").and_then(Value::as_str);
+            match (name, value) {
+                (Some(name), Some(value)) => Ok((name.to_string(), value.to_string())),
+                _ => Err("storage entries need string name and value fields".into()),
+            }
+        } else if let Some(pair) = entry.as_array() {
+            match pair.as_slice() {
+                [Value::String(k), Value::String(v)] => Ok((k.clone(), v.clone())),
+                _ => Err("tuple storage entries need exactly [name, value]".into()),
+            }
+        } else {
+            Err("storage entry must be {name, value} or [name, value]".into())
+        }
+    }).collect()
 }
 
 // Match the Web Storage bridge's escaping of strings that begin with NUL.
@@ -2812,11 +2881,25 @@ fn decode_storage_string(value: String) -> String {
         .unwrap_or(value)
 }
 
-fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
-    let s = args.get("state").and_then(Value::as_object).ok_or("Missing state object")?;
-    let origins: Vec<StorageOrigin> = serde_json::from_value(
-        s.get("origins").cloned().unwrap_or_else(|| json!([])),
-    ).map_err(|error| format!("Invalid storage origins: {error}"))?;
+fn apply_storage_state(s: &serde_json::Map<String, Value>, state: &mut BrowserState) -> Result<String, String> {
+    let origins: Vec<StorageOrigin> = s
+        .get("origins")
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+        .as_array()
+        .ok_or("origins must be an array")?
+        .iter()
+        .map(|entry| {
+            Ok(StorageOrigin {
+                origin: entry.get("origin").and_then(Value::as_str)
+                    .ok_or("each origin needs a string `origin` field")?.to_string(),
+                local_storage: entry.get("localStorage")
+                    .map(parse_storage_entries).transpose()?.unwrap_or_default(),
+                session_storage: entry.get("sessionStorage")
+                    .map(parse_storage_entries).transpose()?.unwrap_or_default(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
     for entry in &origins {
         if !url::Url::parse(&entry.origin).is_ok_and(|url| {
             matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == entry.origin
@@ -2828,6 +2911,8 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
         Some(value) => value.as_array().ok_or("cookies must be an array")?,
         None => &[],
     };
+    // Playwright emits httpOnly/sameSite; earlier exports used http_only/
+    // same_site and expires as int or float (-1 or absent means session).
     let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().map(|c| {
         Some(obscura_net::CookieInfo {
             name: c.get("name")?.as_str()?.to_string(),
@@ -2835,9 +2920,12 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
             domain: c.get("domain")?.as_str()?.to_string(),
             path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
             secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
-            http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
-            same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
-            expires: c.get("expires").and_then(Value::as_i64),
+            http_only: c.get("httpOnly").or_else(|| c.get("http_only"))
+                .and_then(Value::as_bool).unwrap_or(false),
+            same_site: c.get("sameSite").or_else(|| c.get("same_site"))
+                .and_then(Value::as_str).unwrap_or("").to_string(),
+            expires: c.get("expires").and_then(Value::as_i64)
+                .or_else(|| c.get("expires").and_then(Value::as_f64).map(|f| f as i64)),
         })
     }).collect::<Option<Vec<_>>>()
         .ok_or("Each cookie requires string name, value and domain fields")?;
@@ -2863,6 +2951,27 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
     state.context.cookie_jar.set_cookies_from_cdp(parsed);
     state.context.save_storage();
     Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
+}
+
+fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        // Camofox's loadPersistedStorageState: require the documented shape
+        // before trusting the file.
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        let parsed: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("{path} is not a storage-state JSON object: {e}"))?;
+        let object = parsed.as_object()
+            .ok_or_else(|| format!("{path} does not hold a storage-state object"))?;
+        if !object.get("cookies").is_some_and(Value::is_array)
+            || object.get("origins").is_some_and(|v| !v.is_array())
+        {
+            return Err(format!("{path}: storage state needs a cookies array (origins optional)"));
+        }
+        return apply_storage_state(object, state);
+    }
+    let s = args.get("state").and_then(Value::as_object)
+        .ok_or("Missing state object (or `path` to a storage-state file)")?;
+    apply_storage_state(s, state)
 }
 
 #[cfg(test)]
@@ -3309,13 +3418,13 @@ mod tests {
             state.page_mut().navigate(origin).await.expect("fixture page");
             state.page_mut().evaluate(&format!("(function(){{localStorage.setItem('token', '{value}'); sessionStorage.setItem('tab', '{value}-session'); return true;}})()"));
         }
-        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        let exported: Value = serde_json::from_str(&tool_storage_state(&json!({}), &mut state).expect("export")).unwrap();
         let origins = exported["origins"].as_array().expect("origins");
         assert_eq!(origins.len(), 2, "export must not omit the previous origin: {exported}");
         for (origin, value) in [(&first, "first"), (&second, "second")] {
             let entry = origins.iter().find(|entry| entry["origin"] == json!(origin)).expect("visited origin");
-            assert_eq!(entry["localStorage"], json!([["token", value]]));
-            assert_eq!(entry["sessionStorage"], json!([["tab", format!("{value}-session")]]));
+            assert_eq!(entry["localStorage"], json!([{"name": "token", "value": value}]));
+            assert_eq!(entry["sessionStorage"], json!([{"name": "tab", "value": format!("{value}-session")}]));
         }
     }
 
@@ -3353,15 +3462,52 @@ mod tests {
         let mut state = BrowserState::new(None, None, false);
         state.page_mut().navigate(&origin).await.expect("fixture page");
         state.page_mut().evaluate(r#"(function(){localStorage.setItem('\0key', '\0"value"'); sessionStorage.setItem('\0tab', '\0session'); return true;})()"#);
-        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
-        assert_eq!(exported["origins"][0]["localStorage"], json!([["\0key", "\0\"value\""]]));
-        assert_eq!(exported["origins"][0]["sessionStorage"], json!([["\0tab", "\0session"]]));
+        let exported: Value = serde_json::from_str(&tool_storage_state(&json!({}), &mut state).expect("export")).unwrap();
+        assert_eq!(exported["origins"][0]["localStorage"], json!([{"name": "\0key", "value": "\0\"value\""}]));
+        assert_eq!(exported["origins"][0]["sessionStorage"], json!([{"name": "\0tab", "value": "\0session"}]));
         drop(state);
         let mut restored = BrowserState::new(None, None, false);
         tool_set_storage_state(&json!({"state": exported}), &mut restored).expect("restore");
         restored.page_mut().navigate(&origin).await.expect("restored page");
         assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
             json!(["\0\"value\"", "\0session"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_state_file_export_and_playwright_import() {
+        let mut state = BrowserState::new(None, None, false);
+        let dir = std::env::temp_dir().join(format!("obscura-storage-state-{}", std::process::id()));
+        let path = dir.join("nested/state.json");
+        let summary = tool_storage_state(&json!({"path": path.to_str().unwrap()}), &mut state)
+            .expect("export to file");
+        assert!(summary.contains("0 cookies"), "summary: {summary}");
+        assert!(path.exists());
+        // Owner-only file, no tmp sibling left behind.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(std::fs::read_dir(dir.join("nested")).unwrap().all(|e| e.unwrap().file_name() == "state.json"));
+
+        // A Playwright-shaped file restores: httpOnly/sameSite cookie fields,
+        // {name,value} storage entries, float expires.
+        std::fs::write(&path, serde_json::to_string(&json!({
+            "cookies": [{"name": "s", "value": "v", "domain": "httpbin.org", "path": "/",
+                "expires": -1.0, "httpOnly": true, "secure": true, "sameSite": "Lax"}],
+            "origins": [{"origin": "https://first.test", "localStorage": [{"name": "k", "value": "v"}]}],
+        })).unwrap()).unwrap();
+        let mut restored = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"path": path.to_str().unwrap()}), &mut restored)
+            .expect("file restore");
+        assert_eq!(restored.context.local_storage.get("https://first.test", "k").as_deref(), Some("v"));
+        let url = url::Url::parse("https://httpbin.org/").unwrap();
+        assert!(restored.context.cookie_jar.get_cookie_header_same_site(&url).contains("s=v"));
+
+        // A malformed file is rejected before any restore.
+        std::fs::write(&path, "{}").unwrap();
+        assert!(tool_set_storage_state(&json!({"path": path.to_str().unwrap()}), &mut restored).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
