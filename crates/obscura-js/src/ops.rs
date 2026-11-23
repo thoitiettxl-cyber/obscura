@@ -9104,6 +9104,171 @@ fn op_gl(state: &mut OpState, id: i32, #[string] payload: String) -> String {
     serde_json::to_string(&registry.call(id, &payload)).unwrap_or_default()
 }
 
+// ===== WebSocket ===========================================================
+//
+// The page-facing `WebSocket` in bootstrap.js is backed by one driver thread
+// per connection (obscura_net::websocket). The driver owns a current-thread
+// Tokio runtime because ops can run in a context with no Tokio reactor at all
+// (e.g. a plain #[test] isolate). The JS shim keeps exactly one `op_ws_recv`
+// await outstanding after open; it calls Deno.core.unrefOpPromise on it so a
+// quiet socket never keeps the event loop alive.
+
+struct WsConnectionResource {
+    send: tokio::sync::mpsc::UnboundedSender<obscura_net::WsOutbound>,
+    events: Rc<tokio::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<obscura_net::WsInbound>,
+    >>,
+}
+
+impl Resource for WsConnectionResource {}
+
+#[op2]
+#[serde]
+async fn op_ws_connect(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[serde] protocols: Vec<String>,
+    #[string] origin: String,
+    frame_id: u32,
+) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    let parsed = url::Url::parse(&url)
+        .map_err(|error| deno_error::JsErrorBox::type_error(format!("invalid WebSocket URL: {error}")))?;
+    match parsed.scheme() {
+        "ws" | "wss" => {}
+        _ => {
+            return Err(deno_error::JsErrorBox::type_error(
+                "WebSocket URL scheme must be ws or wss",
+            ))
+        }
+    }
+    let shared = frame_state(&state.borrow(), frame_id);
+    let (jar, client) = {
+        let page = shared.borrow();
+        (page.cookie_jar.clone(), page.http_client.clone())
+    };
+    let (proxy_url, allow_private, user_agent_value) = match &client {
+        Some(client) => (
+            client.proxy_url().map(|s| s.to_string()),
+            client.allow_private_network,
+            client.user_agent.read().await.clone(),
+        ),
+        None => (None, false, String::new()),
+    };
+    let headers = [
+        ("Origin".to_string(), origin),
+        ("User-Agent".to_string(), user_agent_value),
+    ];
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("obscura-ws".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = handshake_tx.send(Err(format!("ws runtime: {error}")));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let options = obscura_net::WsOptions {
+                    extra_headers: &headers,
+                    protocols: &protocols,
+                    proxy: proxy_url.as_deref(),
+                    allow_private,
+                };
+                match obscura_net::ws_connect(&parsed, jar.as_deref(), &options).await {
+                    Ok(session) => {
+                        let _ = handshake_tx.send(Ok(session.protocol.clone()));
+                        session.run(events_tx, write_rx).await;
+                    }
+                    Err(error) => {
+                        let _ = handshake_tx.send(Err(error.to_string()));
+                    }
+                }
+            });
+        })
+        .map_err(|error| deno_error::JsErrorBox::generic(format!("ws driver spawn: {error}")))?;
+    let protocol = match handshake_rx.await {
+        Ok(Ok(protocol)) => protocol,
+        Ok(Err(error)) => return Err(deno_error::JsErrorBox::generic(error)),
+        Err(_) => return Err(deno_error::JsErrorBox::generic("ws driver died")),
+    };
+    let rid = state.borrow_mut().resource_table.add(WsConnectionResource {
+        send: write_tx,
+        events: Rc::new(tokio::sync::Mutex::new(events_rx)),
+    });
+    Ok(serde_json::json!({ "rid": rid, "protocol": protocol }))
+}
+
+#[op2]
+#[serde]
+async fn op_ws_recv(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<Option<serde_json::Value>, deno_error::JsErrorBox> {
+    let events = {
+        let resource = state
+            .borrow()
+            .resource_table
+            .get::<WsConnectionResource>(rid)
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        resource.events.clone()
+    };
+    let inbound = events.lock().await.recv().await;
+    let event = match inbound {
+        Some(obscura_net::WsInbound::Text(text)) => {
+            serde_json::json!({ "type": "message", "data": text })
+        }
+        Some(obscura_net::WsInbound::Binary(bytes)) => {
+            serde_json::json!({ "type": "message", "binary": bytes })
+        }
+        Some(obscura_net::WsInbound::Close(code, reason, was_clean)) => {
+            // Terminal event: drop the resource so the send half releases and
+            // the driver can finish winding down.
+            let _ = state.borrow_mut().resource_table.take::<WsConnectionResource>(rid);
+            serde_json::json!({
+                "type": "close", "code": code, "reason": reason, "wasClean": was_clean,
+            })
+        }
+        Some(obscura_net::WsInbound::Error(message)) => {
+            serde_json::json!({ "type": "error", "message": message })
+        }
+        None => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
+#[op2(fast)]
+fn op_ws_send_text(state: &OpState, rid: u32, #[string] data: String) -> bool {
+    match state.resource_table.get::<WsConnectionResource>(rid) {
+        Ok(resource) => resource.send.send(obscura_net::WsOutbound::Text(data)).is_ok(),
+        Err(_) => false,
+    }
+}
+
+#[op2]
+fn op_ws_send_binary(state: &OpState, rid: u32, #[buffer] data: JsBuffer) -> bool {
+    match state.resource_table.get::<WsConnectionResource>(rid) {
+        Ok(resource) => resource
+            .send
+            .send(obscura_net::WsOutbound::Binary(data.to_vec()))
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+#[op2(fast)]
+fn op_ws_close(state: &OpState, rid: u32, code: u32, #[string] reason: String) {
+    if let Ok(resource) = state.resource_table.get::<WsConnectionResource>(rid) {
+        let _ = resource.send.send(obscura_net::WsOutbound::Close(code as u16, reason));
+    }
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -9176,6 +9341,11 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_ws_connect(),
+        op_ws_recv(),
+        op_ws_send_text(),
+        op_ws_send_binary(),
+        op_ws_close(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.

@@ -2145,6 +2145,7 @@ name = "obscura-net"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "compression-codecs",
  "encoding_rs",
  "futures-util",
@@ -2159,8 +2160,11 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "tokio-socks",
+ "tokio-tungstenite",
  "tracing",
  "url",
+ "webpki-roots 0.26.11",
  "wreq",
  "wreq-util",
 ]

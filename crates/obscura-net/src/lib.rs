@@ -3,6 +3,7 @@ mod document_progress;
 pub use document_progress::{DocumentInterruption, DocumentProgress, DocumentRequest, DocumentResponse, InterruptedDocument};
 pub mod cookies;
 pub mod encoding;
+pub mod websocket;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
@@ -22,6 +23,7 @@ pub use encoding::{
     url_encode_query,
 };
 pub use robots::RobotsCache;
+pub use websocket::{connect as ws_connect, WsInbound, WsOptions, WsOutbound, WsSession};
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{
