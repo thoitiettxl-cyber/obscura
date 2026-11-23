@@ -692,7 +692,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_extract",
-                "description": "Extract a structured object from the page given a map of {field_name: css_selector}. Returns one JSON object with each field set to the matching element's text content (or attribute via 'selector@attr' syntax, e.g. 'a@href'). For list extraction, append '[]' to the field name (e.g. 'rows[]') and the value will be an array.",
+                "description": "Extract a structured object from the page. Two schema forms: (1) a map of {field_name: css_selector} where each field gets the matching element's text content (or attribute via 'selector@attr', e.g. 'a@href'; append '[]' to the field name for an array); (2) a JSON-schema object {'type':'object','properties':{field:{'x-ref':'e1-2','type':'number'}},'required':[...]} where each 'x-ref' is a ref from the last browser_snapshot and the element's text is coerced to the declared type (string|number|integer|boolean).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2436,6 +2436,11 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
     let schema = args.get("schema").and_then(Value::as_object)
         .ok_or("Missing schema object")?
         .clone();
+    // JSON-schema mode (camofox extractDeterministic): properties resolve by
+    // `x-ref` against the refs of the last browser_snapshot.
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        return tool_extract_xref(&schema, properties, state);
+    }
     let schema_json = serde_json::to_string(&schema).unwrap();
     let js = format!(r#"(function(){{
         var schema = {schema};
@@ -2471,6 +2476,88 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
     }})()"#, schema = schema_json);
     let res = evaluate_tool_script(state.page_mut(), &js)?;
     serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+}
+
+const XREF_SUPPORTED_TYPES: &[&str] = &["string", "number", "integer", "boolean", "object", "null"];
+
+fn coerce_xref_value(raw: &str, ty: &str) -> Option<Value> {
+    match ty {
+        "" | "string" => Some(json!(raw.trim())),
+        "number" => {
+            let filtered: String = raw
+                .chars()
+                .filter(|c| c.is_ascii_digit() || ".eE+-".contains(*c))
+                .collect();
+            filtered.parse::<f64>().ok().map(|n| json!(n))
+        }
+        "integer" => {
+            let filtered: String = raw
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            filtered.parse::<i64>().ok().map(|n| json!(n))
+        }
+        "boolean" => match raw.trim().to_lowercase().as_str() {
+            "true" | "yes" | "1" => Some(json!(true)),
+            "false" | "no" | "0" => Some(json!(false)),
+            _ => None,
+        },
+        _ => Some(json!(raw)),
+    }
+}
+
+/// Port of camofox `extractDeterministic`: each property's `x-ref` names a
+/// ref from the last `browser_snapshot`; the resolved element's text is
+/// coerced to the declared type. Required properties that cannot be
+/// extracted abort the call.
+fn tool_extract_xref(
+    schema: &serde_json::Map<String, Value>,
+    properties: &serde_json::Map<String, Value>,
+    state: &mut BrowserState,
+) -> Result<String, String> {
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err("top-level schema must have type: object".to_string());
+    }
+    for (prop, def) in properties {
+        let def_obj = def.as_object()
+            .ok_or_else(|| format!("property \"{prop}\" must be an object"))?;
+        if let Some(ty) = def_obj.get("type").and_then(Value::as_str) {
+            if !XREF_SUPPORTED_TYPES.contains(&ty) {
+                return Err(format!("property \"{prop}\" has unsupported type \"{ty}\""));
+            }
+        }
+    }
+    let required: Vec<&str> = schema.get("required").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for (prop, def) in properties {
+        let ref_id = def.get("x-ref").and_then(Value::as_str);
+        let ty = def.get("type").and_then(Value::as_str).unwrap_or("string");
+        let entry = ref_id.and_then(|r| state.interactive_refs.get(r))
+            .map(|e| (e.node_id, e.allocation_generation));
+        let value = entry.and_then(|(node_id, generation)| {
+            state.page_mut().with_dom(|dom| {
+                // A stale ref may point at a reused arena slot.
+                if dom.node_allocation_generation(node_id) != Some(generation) {
+                    return None;
+                }
+                let text = dom.text_content(node_id);
+                if ty == "object" {
+                    return Some(json!(text));
+                }
+                coerce_xref_value(&text, ty)
+            })
+        }).flatten().unwrap_or(Value::Null);
+        if value == Value::Null && required.contains(&prop.as_str()) {
+            return Err(format!(
+                "required property \"{prop}\" could not be extracted (x-ref={})",
+                ref_id.unwrap_or("n/a")
+            ));
+        }
+        out.insert(prop.clone(), value);
+    }
+    serde_json::to_string_pretty(&Value::Object(out)).map_err(|e| e.to_string())
 }
 
 async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -4122,6 +4209,43 @@ mod tests {
 
     // Every MCP route that navigates must refuse local files, not only
     // browser_navigate: the browser layer enforces it for all of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn extract_xref_resolves_snapshot_refs_with_type_coercion() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(
+            "data:text/html,<a href='/buy' id='buy'>Buy now $19.50</a><button id='n'>99</button>",
+        ).await.unwrap();
+        tool_snapshot(&json!({}), &mut state).unwrap();
+        let entries: Vec<(String, NodeId)> = state.interactive_refs.iter()
+            .map(|(r, e)| (r.clone(), e.node_id)).collect();
+        let mut ref_for = |want: &str| entries.iter().find_map(|(r, nid)| {
+            state.page_mut().with_dom(|dom| {
+                dom.get_node(*nid)?.get_attribute("id").filter(|id| *id == want)?;
+                Some(r.clone())
+            }).flatten()
+        });
+        let buy_ref = ref_for("buy").expect("link ref");
+        let n_ref = ref_for("n").expect("button ref");
+        let schema = json!({"type":"object","properties":{
+            "price":{"x-ref":buy_ref,"type":"number"},
+            "count":{"x-ref":n_ref,"type":"integer"},
+            "missing":{"x-ref":"e99-1"}
+        }});
+        let out: Value = serde_json::from_str(
+            &tool_extract(&json!({"schema":schema}), &mut state).unwrap()).unwrap();
+        assert_eq!(out["price"], json!(19.50));
+        assert_eq!(out["count"], json!(99));
+        assert_eq!(out["missing"], json!(null));
+        // A required property that cannot be extracted aborts the call.
+        let required = json!({"type":"object","properties":{
+            "missing":{"x-ref":"e99-1"}},"required":["missing"]});
+        let err = tool_extract(&json!({"schema":required}), &mut state).unwrap_err();
+        assert!(err.contains("required property \"missing\""), "{err}");
+        // Non-object top-level type is rejected.
+        let bad = json!({"type":"array","properties":{}});
+        assert!(tool_extract(&json!({"schema":bad}), &mut state).unwrap_err().contains("type: object"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn tab_new_nav_failure_leaves_no_orphan_tab() {
         let mut state = BrowserState::new(None, None, false);
