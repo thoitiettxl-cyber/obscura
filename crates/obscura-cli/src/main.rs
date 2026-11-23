@@ -142,6 +142,16 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         worker_max_age: Option<u64>,
 
+        /// Close a CDP target on this connection that no command has
+        /// touched for this many milliseconds (per-connection idle-page
+        /// reaper; the usual detachedFromTarget/targetDestroyed events are
+        /// emitted). Pages with an in-flight awaited evaluation are leased
+        /// and never reaped. Off by default; camofox's service equivalent
+        /// (TAB_INACTIVITY_MS) defaults to 300000. Equivalent to
+        /// OBSCURA_PAGE_IDLE_MS.
+        #[arg(long, value_name = "MS")]
+        page_idle_timeout_ms: Option<u64>,
+
         /// Seconds a replaced worker may keep serving its live connections
         /// before it is killed.
         #[arg(long, value_name = "SECS", default_value_t = 120)]
@@ -593,8 +603,13 @@ async fn run_cli() -> anyhow::Result<()> {
             allow_file_access,
             storage_dir,
             font_dirs,
+            page_idle_timeout_ms,
             quiet: _,
         }) => {
+            if let Some(ms) = page_idle_timeout_ms {
+                // SAFETY: still single-threaded startup; workers inherit env.
+                unsafe { std::env::set_var("OBSCURA_PAGE_IDLE_MS", ms.to_string()); }
+            }
             let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             let policy = pool::RecyclePolicy {
                 max_connections: worker_max_connections,
